@@ -2278,36 +2278,87 @@ import { WebSocketServer } from "ws";
 // src/media/twilioFrames.ts
 var MULAW_FRAME_BYTES = 160;
 var TELEPHONY_SAMPLE_RATE = 8e3;
+var MAX_FRAME_CHARS = 262144;
+var MAX_IDENTIFIER_CHARS = 256;
+var MAX_CUSTOM_PARAMETERS = 128;
+var MAX_CUSTOM_VALUE_CHARS = 2048;
+var MAX_PAYLOAD_CHARS = 65536;
+function isObject2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedString(value, max, nonempty = false) {
+  return typeof value === "string" && value.length <= max && (!nonempty || value.trim().length > 0);
+}
+function optionalString(object2, key, max, nonempty = false) {
+  return !Object.hasOwn(object2, key) || boundedString(object2[key], max, nonempty);
+}
+function validStart(value, streamSid) {
+  if (!isObject2(value)) return false;
+  if (!optionalString(value, "streamSid", MAX_IDENTIFIER_CHARS, true) || Object.hasOwn(value, "streamSid") && value["streamSid"] !== streamSid || !optionalString(value, "callSid", MAX_IDENTIFIER_CHARS, true) || // The embedded bridge deliberately sends an empty accountSid.
+  !optionalString(value, "accountSid", MAX_IDENTIFIER_CHARS)) return false;
+  if (Object.hasOwn(value, "tracks")) {
+    const tracks = value["tracks"];
+    if (!Array.isArray(tracks) || tracks.length > 2 || !tracks.every((track) => track === "inbound" || track === "outbound")) return false;
+  }
+  if (Object.hasOwn(value, "customParameters")) {
+    const custom = value["customParameters"];
+    if (!isObject2(custom)) return false;
+    const entries = Object.entries(custom);
+    if (entries.length > MAX_CUSTOM_PARAMETERS || !entries.every(([key, entry2]) => boundedString(key, MAX_IDENTIFIER_CHARS, true) && boundedString(entry2, MAX_CUSTOM_VALUE_CHARS))) return false;
+  }
+  if (Object.hasOwn(value, "mediaFormat")) {
+    const format = value["mediaFormat"];
+    if (!isObject2(format) || !boundedString(format["encoding"], 128, true) || typeof format["sampleRate"] !== "number" || !Number.isSafeInteger(format["sampleRate"]) || format["sampleRate"] <= 0 || format["sampleRate"] > 192e3 || Object.hasOwn(format, "channels") && (typeof format["channels"] !== "number" || !Number.isSafeInteger(format["channels"]) || format["channels"] <= 0 || format["channels"] > 32)) return false;
+  }
+  return true;
+}
+function validPayload(value) {
+  if (!boundedString(value, MAX_PAYLOAD_CHARS)) return false;
+  if (/[^A-Za-z0-9+/=]/.test(value)) return false;
+  const padding = value.indexOf("=");
+  if (padding < 0) return value.length % 4 !== 1;
+  return value.length % 4 === 0 && (value.endsWith("==") ? padding === value.length - 2 : padding === value.length - 1);
+}
 function parseMediaStreamsFrame(raw) {
+  if (typeof raw !== "string" || raw.length > MAX_FRAME_CHARS) return null;
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
+  if (!isObject2(parsed)) return null;
   const frame = parsed;
   const event = frame["event"];
-  if (event !== "connected" && (typeof frame["streamSid"] !== "string" || !frame["streamSid"])) return null;
-  const hasStringField = (value, key) => typeof value === "object" && value !== null && !Array.isArray(value) && typeof value[key] === "string";
+  if (event !== "connected" && !boundedString(frame["streamSid"], MAX_IDENTIFIER_CHARS, true)) return null;
+  if (!optionalString(frame, "sequenceNumber", 32, true)) return null;
   switch (event) {
-    case "media":
-      if (!hasStringField(frame["media"], "payload")) return null;
-      return parsed;
-    case "mark":
-      if (!hasStringField(frame["mark"], "name")) return null;
-      return parsed;
-    case "dtmf":
-      if (!hasStringField(frame["dtmf"], "digit")) return null;
-      return parsed;
-    case "connected":
     case "start":
-    case "clear":
+      if (Object.hasOwn(frame, "start") && !validStart(frame["start"], frame["streamSid"])) return null;
+      break;
+    case "media": {
+      const media = frame["media"];
+      if (!isObject2(media) || !validPayload(media["payload"]) || !optionalString(media, "track", 32, true) || !optionalString(media, "chunk", 32, true) || !optionalString(media, "timestamp", 32, true)) return null;
+      break;
+    }
+    case "mark":
+      if (!isObject2(frame["mark"]) || !boundedString(frame["mark"]["name"], 256, true)) return null;
+      break;
+    case "dtmf":
+      if (!isObject2(frame["dtmf"]) || typeof frame["dtmf"]["digit"] !== "string" || !/^[0-9A-Da-d*#]$/.test(frame["dtmf"]["digit"]) || !optionalString(frame["dtmf"], "track", 32, true)) return null;
+      break;
     case "stop":
-      return parsed;
+      if (Object.hasOwn(frame, "stop") && (!isObject2(frame["stop"]) || !optionalString(frame["stop"], "callSid", MAX_IDENTIFIER_CHARS, true) || !optionalString(frame["stop"], "accountSid", MAX_IDENTIFIER_CHARS))) return null;
+      break;
+    case "connected":
+      if (!optionalString(frame, "protocol", 128, true) || !optionalString(frame, "version", 128, true) || !optionalString(frame, "streamSid", MAX_IDENTIFIER_CHARS, true)) return null;
+      break;
+    case "clear":
+      break;
     default:
       return null;
   }
+  return parsed;
 }
 function decodeMediaPayload(event) {
   return new Uint8Array(Buffer.from(event.media.payload, "base64"));
@@ -2630,13 +2681,14 @@ var CallSession = class {
 var CallRegistry = class {
   calls = /* @__PURE__ */ new Map();
   add(session) {
+    if (this.calls.has(session.streamSid)) throw new Error("Duplicate active streamSid");
     this.calls.set(session.streamSid, session);
   }
   get(streamSid) {
     return this.calls.get(streamSid);
   }
-  remove(streamSid) {
-    this.calls.delete(streamSid);
+  remove(session) {
+    if (this.calls.get(session.streamSid) === session) this.calls.delete(session.streamSid);
   }
   get size() {
     return this.calls.size;
@@ -2729,91 +2781,125 @@ var MediaServer = class extends EventEmitter {
     });
     return this.stopping;
   }
+  /** Diagnostics must not become an unhandled EventEmitter error (or throw from a listener). */
+  reportError(error) {
+    try {
+      if (this.listenerCount("error"))
+        this.emit("error", error instanceof Error ? error : new Error(String(error)));
+    } catch {
+    }
+  }
+  log(message, fields) {
+    try {
+      this.options.onLog?.(message, fields);
+    } catch (error) {
+      this.reportError(error);
+    }
+  }
   attach(socket, remote) {
     let session = null;
-    this.options.onLog?.("media-connection-open", { remote });
+    const fail = (error) => {
+      try {
+        session?.end("media-message-error");
+      } catch (cleanupError) {
+        this.reportError(cleanupError);
+      } finally {
+        socket.terminate();
+      }
+      this.reportError(error);
+    };
+    this.log("media-connection-open", { remote });
     socket.on("message", (data) => {
-      const event = parseMediaStreamsFrame(String(data));
-      if (!event) return;
-      switch (event.event) {
-        case "start": {
-          if (session) {
-            socket.terminate();
-            break;
-          }
-          const start = event.start ?? {};
-          const format = start.mediaFormat;
-          const codec = format ? codecFromFormat(format.encoding ?? "", format.sampleRate ?? 0) : "pcmu";
-          if (!codec || format?.channels !== void 0 && format.channels !== 1) {
-            this.emit("error", new Error("Unsupported mono media stream codec or sample rate"));
-            socket.terminate();
-            break;
-          }
-          const custom = start.customParameters ?? {};
-          const started = new CallSession({
-            streamSid: event.streamSid,
-            codec,
-            callSid: start.callSid,
-            from: custom["From"] ?? custom["from"] ?? custom["caller"],
-            to: custom["To"] ?? custom["to"] ?? custom["dialed"],
-            onSend: (payload) => {
-              if (socket.readyState !== socket.OPEN) return;
-              if (socket.bufferedAmount + Buffer.byteLength(payload) > 262144) {
-                started.end("media-backpressure");
-                return;
-              }
-              socket.send(payload, (error) => {
-                if (error) started.end("media-send-error");
-              });
-            },
-            onEnd: (reason) => {
-              this.registry.remove(event.streamSid);
-              this.emit("end", event.streamSid, reason);
+      try {
+        const event = parseMediaStreamsFrame(String(data));
+        if (!event)
+          return;
+        if (event.event !== "start" && "streamSid" in event && (!session || event.streamSid !== session.streamSid || session.currentState === "ended"))
+          return;
+        switch (event.event) {
+          case "start": {
+            if (session || this.registry.get(event.streamSid)) {
               socket.terminate();
+              return;
             }
-          });
-          started.activate();
-          session = started;
-          this.registry.add(started);
-          this.options.onLog?.("call-start", { streamSid: started.streamSid, remote });
-          this.emit("call", started, custom);
-          break;
+            const start = event.start;
+            const format = start.mediaFormat;
+            const codec = format ? codecFromFormat(format.encoding ?? "", format.sampleRate ?? 0) : "pcmu";
+            if (!codec || format?.channels !== void 0 && format.channels !== 1) {
+              throw new Error("Unsupported mono media stream codec or sample rate");
+            }
+            const custom = start.customParameters ?? {};
+            const started = new CallSession({
+              streamSid: event.streamSid,
+              codec,
+              callSid: start.callSid,
+              from: custom["From"] ?? custom["from"] ?? custom["caller"],
+              to: custom["To"] ?? custom["to"] ?? custom["dialed"],
+              onSend: (payload) => {
+                try {
+                  if (socket.readyState !== socket.OPEN)
+                    return;
+                  if (socket.bufferedAmount + Buffer.byteLength(payload) > 262144) {
+                    started.end("media-backpressure");
+                    return;
+                  }
+                  socket.send(payload, (error) => {
+                    if (error)
+                      fail(error);
+                  });
+                } catch (error) {
+                  fail(error);
+                }
+              },
+              onEnd: (reason) => {
+                this.registry.remove(started);
+                try {
+                  this.emit("end", started.streamSid, reason, started);
+                } catch (error) {
+                  this.reportError(error);
+                } finally {
+                  socket.terminate();
+                }
+              }
+            });
+            session = started;
+            this.registry.add(started);
+            started.activate();
+            this.options.onLog?.("call-start", { streamSid: started.streamSid, remote });
+            this.emit("call", started, custom);
+            break;
+          }
+          case "media":
+            if (session)
+              this.emit("audio", session, decodeMediaPayload(event));
+            break;
+          case "dtmf":
+            if (session)
+              this.emit("dtmf", session, event.dtmf.digit);
+            break;
+          case "mark":
+            if (session)
+              this.emit("mark", session, event.mark.name);
+            break;
+          case "stop":
+            session?.end("gateway-stop");
+            break;
+          default:
+            break;
         }
-        case "media": {
-          if (!session) break;
-          this.emit("audio", session, decodeMediaPayload(event));
-          break;
-        }
-        case "dtmf": {
-          if (!session) break;
-          this.emit("dtmf", session, event.dtmf.digit);
-          break;
-        }
-        case "mark": {
-          if (!session) break;
-          this.emit("mark", session, event.mark.name);
-          break;
-        }
-        case "stop": {
-          if (!session) break;
-          this.registry.remove(session.streamSid);
-          session.end("gateway-stop");
-          session = null;
-          break;
-        }
-        default:
-          break;
+      } catch (error) {
+        fail(error);
       }
     });
     socket.on("close", () => {
-      const current = session;
-      if (current) {
-        this.registry.remove(current.streamSid);
-        current.end("websocket-close");
+      try {
+        session?.end("websocket-close");
+      } catch (error) {
+        this.reportError(error);
       }
-      this.options.onLog?.("media-connection-close", { remote });
+      this.log("media-connection-close", { remote });
     });
-    socket.on("error", (err) => this.emit("error", err));
+    socket.on("error", fail);
   }
 };
 
@@ -6774,40 +6860,85 @@ async function startSipPlugin(rawConfig, hooks = {}, dependencies = {}) {
     onLog: hooks.onLog
   });
   let embedded;
-  const sessions = /* @__PURE__ */ new Map();
+  const sessions = /* @__PURE__ */ new Set();
   const voices = /* @__PURE__ */ new Map();
+  const log = (event, fields) => {
+    try {
+      hooks.onLog?.(event, fields);
+    } catch {
+    }
+  };
   server.on("call", (session, custom) => {
-    sessions.set(session.streamSid, session);
-    if (hooks.admitCall && !hooks.admitCall(session, custom)) return;
+    sessions.add(session);
+    if (hooks.admitCall && !hooks.admitCall(session, custom)) {
+      session.end("sip-rejected");
+      return;
+    }
+    if (session.currentState === "ended")
+      return;
     if (config.voice.enabled) {
       if (voices.size >= config.inbound.maxConcurrent) {
         session.end("voice-call-limit");
         return;
       }
-      const log = (event, fields) => hooks.onLog?.(event, fields);
-      voices.set(session.streamSid, config.voice.engine === "deepgram-agent" ? new DeepgramAgentCall(session, config, log, dependencies.agent, hooks.onUtterance) : new VoiceCall(session, config, hooks.onUtterance, log, dependencies.voice));
+      const voice = config.voice.engine === "deepgram-agent" ? new DeepgramAgentCall(session, config, log, dependencies.agent, hooks.onUtterance) : new VoiceCall(session, config, hooks.onUtterance, log, dependencies.voice);
+      if (!sessions.has(session)) {
+        voice.stop();
+        return;
+      }
+      voices.set(session, voice);
     }
-    void Promise.resolve().then(() => hooks.onCall?.(session, custom)).catch(() => hooks.onLog?.("call-hook-error"));
+    void Promise.resolve().then(() => {
+      if (session.currentState !== "ended")
+        return hooks.onCall?.(session, custom);
+    }).catch(() => {
+      log("call-hook-error");
+      session.end("call-hook-error");
+    });
   });
   server.on("audio", (session, audio) => {
-    voices.get(session.streamSid)?.audio(audio);
+    if (!sessions.has(session))
+      return;
+    voices.get(session)?.audio(audio);
     hooks.onAudio?.(session, audio);
   });
   server.on("dtmf", (session, digit) => {
-    voices.get(session.streamSid)?.dtmf?.(digit);
+    if (!sessions.has(session))
+      return;
+    voices.get(session)?.dtmf?.(digit);
     hooks.onDtmf?.(session, digit);
   });
-  server.on("mark", (session, name) => hooks.onMark?.(session, name));
-  server.on("end", (streamSid, reason) => {
-    const session = sessions.get(streamSid);
-    sessions.delete(streamSid);
-    hooks.onLog?.("call-end", { reason });
-    if (session?.callSid) embedded?.terminateCall?.(session.callSid, reason);
-    voices.get(streamSid)?.stop();
-    voices.delete(streamSid);
-    hooks.onEnd?.(streamSid, reason);
+  server.on("mark", (session, name) => {
+    if (sessions.has(session))
+      hooks.onMark?.(session, name);
   });
-  server.on("error", (err) => hooks.onLog?.("media-error", { message: err.message }));
+  server.on("end", (_streamSid, reason, session) => {
+    if (!sessions.delete(session))
+      return;
+    const voice = voices.get(session);
+    voices.delete(session);
+    try {
+      voice?.stop();
+    } catch {
+      log("voice-stop-error");
+    }
+    try {
+      if (session.callSid)
+        embedded?.terminateCall?.(session.callSid, reason);
+    } catch {
+      log("call-terminate-error");
+    }
+    try {
+      hooks.onSessionEnd?.(session, reason);
+    } finally {
+      try {
+        hooks.onEnd?.(session.streamSid, reason);
+      } finally {
+        log("call-end", { reason });
+      }
+    }
+  });
+  server.on("error", (err) => log("media-error", { message: err.message }));
   await server.start();
   try {
     if (config.transport === "embedded") {
@@ -6838,7 +6969,7 @@ async function startSipPlugin(rawConfig, hooks = {}, dependencies = {}) {
 // src/channel.ts
 function callerE164(session, custom, numbering) {
   const value = session.from ?? custom["from"] ?? custom["From"] ?? custom["caller"];
-  if (!value) return void 0;
+  if (typeof value !== "string" || value.length === 0 || value.length > 1024) return void 0;
   const uri = value.trim();
   const national = /^(?:sip:|tel:)?(\d{3,15})(?:@[^\s;>]+)?(?:;[^\s>]*)?$/.exec(uri)?.[1];
   const prefix = numbering?.callerNationalPrefix ?? "0";
@@ -6853,17 +6984,19 @@ var SipAdmission = class {
   config;
   accepted = /* @__PURE__ */ new Map();
   admit(session, custom) {
-    if (this.accepted.has(session.streamSid)) return true;
+    const existing = this.accepted.get(session.streamSid);
+    if (existing) return existing.session === session;
     const caller = callerE164(session, custom, this.config.inbound);
     if (!caller || !this.config.voice.enabled || this.config.inbound.policy === "allowlist" && !this.config.inbound.allowFrom.includes(caller) || this.accepted.size >= this.config.inbound.maxConcurrent) return false;
-    this.accepted.set(session.streamSid, caller);
+    this.accepted.set(session.streamSid, { session, caller });
     return true;
   }
   caller(session) {
-    return this.accepted.get(session.streamSid);
+    const accepted = this.accepted.get(session.streamSid);
+    return accepted?.session === session ? accepted.caller : void 0;
   }
-  end(streamSid) {
-    this.accepted.delete(streamSid);
+  end(session) {
+    if (this.accepted.get(session.streamSid)?.session === session) this.accepted.delete(session.streamSid);
   }
 };
 async function dispatchSipTurn(api, config, caller, text2, signal) {
@@ -6995,8 +7128,8 @@ function registerSipRuntime(api, start = startSipPlugin) {
           report(true);
           return dispatchSipTurn(api, config, caller, text2, signal);
         },
-        onEnd: (sid) => {
-          admission.end(sid);
+        onSessionEnd: (session) => {
+          admission.end(session);
         },
         onLog: (message, fields) => api.logger.info(fields ? `${message} ${JSON.stringify(fields)}` : message)
       });

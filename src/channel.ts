@@ -6,7 +6,7 @@ import { MAX_VOICE_REPLY_CHARS } from './voice/textLimits.js';
 export function callerE164(session: CallSession, custom: Record<string, string>,
   numbering?: Pick<SipPluginConfig['inbound'], 'callerCountryCode' | 'callerNationalPrefix'>): string | undefined {
   const value = session.from ?? custom['from'] ?? custom['From'] ?? custom['caller'];
-  if (!value) return undefined;
+  if (typeof value !== 'string' || value.length === 0 || value.length > 1024) return undefined;
   const uri = value.trim();
   const national = /^(?:sip:|tel:)?(\d{3,15})(?:@[^\s;>]+)?(?:;[^\s>]*)?$/.exec(uri)?.[1];
   const prefix = numbering?.callerNationalPrefix ?? '0';
@@ -19,18 +19,24 @@ export function callerE164(session: CallSession, custom: Record<string, string>,
 
 /** Only admitted calls occupy slots; reserve synchronously before any async work. */
 export class SipAdmission {
-  private accepted = new Map<string, string>();
+  private accepted = new Map<string, { session: CallSession; caller: string }>();
   constructor(private config: SipPluginConfig) { }
   admit(session: CallSession, custom: Record<string, string>): boolean {
-    if (this.accepted.has(session.streamSid)) return true;
+    const existing = this.accepted.get(session.streamSid);
+    if (existing) return existing.session === session;
     const caller = callerE164(session, custom, this.config.inbound);
     if (!caller || !this.config.voice.enabled ||
       (this.config.inbound.policy === 'allowlist' && !this.config.inbound.allowFrom.includes(caller)) ||
       this.accepted.size >= this.config.inbound.maxConcurrent) return false;
-    this.accepted.set(session.streamSid, caller); return true;
+    this.accepted.set(session.streamSid, { session, caller }); return true;
   }
-  caller(session: CallSession): string | undefined { return this.accepted.get(session.streamSid); }
-  end(streamSid: string): void { this.accepted.delete(streamSid); }
+  caller(session: CallSession): string | undefined {
+    const accepted = this.accepted.get(session.streamSid);
+    return accepted?.session === session ? accepted.caller : undefined;
+  }
+  end(session: CallSession): void {
+    if (this.accepted.get(session.streamSid)?.session === session) this.accepted.delete(session.streamSid);
+  }
 }
 
 /** Host dispatch retains agent model/tools policy. No direct LLM or tool execution. */

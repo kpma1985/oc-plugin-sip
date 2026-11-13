@@ -35,6 +35,8 @@ export interface SipPluginHooks {
   onUtterance?: UtteranceHook;
   onMark?: (session: CallSession, name: string) => void;
   onEnd?: (streamSid: string, reason: string) => void;
+  /** Ownership-aware teardown; use this to release admission or other session resources. */
+  onSessionEnd?: (session: CallSession, reason: string) => void;
   admitCall?: (session: CallSession, custom: Record<string, string>) => boolean;
 }
 
@@ -70,38 +72,91 @@ export async function startSipPlugin(
   });
 
   let embedded: Awaited<ReturnType<typeof startEmbeddedTransport>> | undefined;
-  const sessions = new Map<string, CallSession>();
-  const voices = new Map<string, VoiceEngine>();
-  server.on('call', (session, custom) => {
-    sessions.set(session.streamSid, session);
-    if (hooks.admitCall && !hooks.admitCall(session, custom)) return;
-    if (config.voice.enabled) {
-      if (voices.size >= config.inbound.maxConcurrent) { session.end('voice-call-limit'); return; }
-      const log = (event: string, fields?: Record<string, unknown>): void => hooks.onLog?.(event, fields);
-      voices.set(session.streamSid, config.voice.engine === 'deepgram-agent'
-        ? new DeepgramAgentCall(session, config, log, dependencies.agent, hooks.onUtterance)
-        : new VoiceCall(session, config, hooks.onUtterance, log, dependencies.voice));
+  // Object identity, not client-controlled protocol metadata, owns every resource.
+  const sessions = new Set<CallSession>();
+  const voices = new Map<CallSession, VoiceEngine>();
+  const log = (event: string, fields?: Record<string, unknown>): void => {
+    try {
+      hooks.onLog?.(event, fields);
     }
-    void Promise.resolve().then(() => hooks.onCall?.(session, custom)).catch(() => hooks.onLog?.('call-hook-error'));
+    catch { /* diagnostics must not interrupt cleanup */ }
+  };
+  server.on('call', (session, custom) => {
+    sessions.add(session);
+    // Any synchronous failure propagates to MediaServer's per-message rollback boundary.
+    if (hooks.admitCall && !hooks.admitCall(session, custom)) {
+      session.end('sip-rejected');
+      return;
+    }
+    if (session.currentState === 'ended')
+      return;
+    if (config.voice.enabled) {
+      if (voices.size >= config.inbound.maxConcurrent) {
+        session.end('voice-call-limit');
+        return;
+      }
+      const voice = config.voice.engine === 'deepgram-agent'
+        ? new DeepgramAgentCall(session, config, log, dependencies.agent, hooks.onUtterance)
+        : new VoiceCall(session, config, hooks.onUtterance, log, dependencies.voice);
+      if (!sessions.has(session)) {
+        voice.stop();
+        return;
+      }
+      voices.set(session, voice);
+    }
+    void Promise.resolve().then(() => {
+      if (session.currentState !== 'ended')
+        return hooks.onCall?.(session, custom);
+    }).catch(() => { log('call-hook-error'); session.end('call-hook-error'); });
   });
   server.on('audio', (session, audio) => {
-    voices.get(session.streamSid)?.audio(audio);
+    if (!sessions.has(session))
+      return;
+    voices.get(session)?.audio(audio);
     hooks.onAudio?.(session, audio);
   });
   server.on('dtmf', (session, digit) => {
-    voices.get(session.streamSid)?.dtmf?.(digit);
+    if (!sessions.has(session))
+      return;
+    voices.get(session)?.dtmf?.(digit);
     hooks.onDtmf?.(session, digit);
   });
-  server.on('mark', (session, name) => hooks.onMark?.(session, name));
-  server.on('end', (streamSid, reason) => {
-    const session = sessions.get(streamSid); sessions.delete(streamSid);
-  hooks.onLog?.('call-end', { reason });
-    if (session?.callSid) embedded?.terminateCall?.(session.callSid, reason);
-    voices.get(streamSid)?.stop(); voices.delete(streamSid);
-    hooks.onEnd?.(streamSid, reason);
+  server.on('mark', (session, name) => {
+    if (sessions.has(session))
+      hooks.onMark?.(session, name);
   });
-  server.on('error', (err) => hooks.onLog?.('media-error', { message: err.message }));
-
+  server.on('end', (_streamSid, reason, session) => {
+    if (!sessions.delete(session))
+      return;
+    const voice = voices.get(session);
+    voices.delete(session);
+    // Run every cleanup even if an embedded, voice, or application hook throws.
+    try {
+      voice?.stop();
+    }
+    catch {
+      log('voice-stop-error');
+    }
+    try {
+      if (session.callSid)
+        embedded?.terminateCall?.(session.callSid, reason);
+    }
+    catch {
+      log('call-terminate-error');
+    }
+    try {
+      hooks.onSessionEnd?.(session, reason);
+    }
+    finally {
+      try {
+        hooks.onEnd?.(session.streamSid, reason);
+      }
+      finally {
+        log('call-end', { reason });
+      }
+    }
+  });
+  server.on('error', (err) => log('media-error', { message: err.message }));
   await server.start();
   try {
     if (config.transport === 'embedded') {

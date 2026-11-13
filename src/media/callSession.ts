@@ -210,6 +210,7 @@ export class CallRegistry {
   private readonly calls = new Map<string, CallSession>();
 
   add(session: CallSession): void {
+    if (this.calls.has(session.streamSid)) throw new Error('Duplicate active streamSid');
     this.calls.set(session.streamSid, session);
   }
 
@@ -217,8 +218,8 @@ export class CallRegistry {
     return this.calls.get(streamSid);
   }
 
-  remove(streamSid: string): void {
-    this.calls.delete(streamSid);
+  remove(session: CallSession): void {
+    if (this.calls.get(session.streamSid) === session) this.calls.delete(session.streamSid);
   }
 
   get size(): number {

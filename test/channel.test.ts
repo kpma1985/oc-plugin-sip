@@ -11,8 +11,9 @@ describe('SIP admission', () => {
     const numbering = { callerCountryCode: '49', callerNationalPrefix: '0' };
     const policy = new SipAdmission(parseSipConfig({ voice: { enabled: true }, inbound: { allowFrom: ['+4912345'], ...numbering } }));
     expect(callerE164(session('national', 'sip:012345@sipconnect.sipgate.de'), {}, numbering)).toBe('+4912345');
-    expect(policy.admit(session('allowed', 'sip:012345@sipconnect.sipgate.de'), {})).toBe(true);
-    policy.end('allowed');
+    const allowed = session('allowed', 'sip:012345@sipconnect.sipgate.de');
+    expect(policy.admit(allowed, {})).toBe(true);
+    policy.end(allowed);
     expect(policy.admit(session('unknown', 'sip:012346@sipconnect.sipgate.de'), {})).toBe(false);
     expect(callerE164(session('foreign', 'sip:012345@example.org'), {})).toBeUndefined();
     expect(callerE164(session('anonymous', 'sip:anonymous@sipconnect.sipgate.de'), {})).toBeUndefined();
@@ -28,7 +29,7 @@ describe('SIP admission', () => {
     const policy = new SipAdmission(config), a = session('a', '+4912345');
     expect(policy.admit(a, {})).toBe(true); expect(policy.admit(a, {})).toBe(true);
     expect(policy.admit(session('b', '+4912345'), {})).toBe(false);
-    policy.end('a'); expect(policy.admit(session('c', '+4912345'), {})).toBe(true);
+    policy.end(a); expect(policy.admit(session('c', '+4912345'), {})).toBe(true);
   });
   it('normalizes SIP E164 and rejects voice-disabled even open', () => {
     expect(callerE164(session('a', 'sip:+4912345@example.org'), {})).toBe('+4912345');

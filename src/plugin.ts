@@ -84,8 +84,8 @@ export function registerSipRuntime(api: OpenClawPluginApi,
           report(true);
           return dispatchSipTurn(api, config, caller, text, signal);
         },
-        onEnd: (sid) => {
-          admission.end(sid);
+        onSessionEnd: (session) => {
+          admission.end(session);
         },
         onLog: (message, fields) => api.logger.info(fields ? `${message} ${JSON.stringify(fields)}` : message),
       });
