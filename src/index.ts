@@ -65,6 +65,7 @@ export async function startSipPlugin(
     host: config.media.host,
     port: config.media.port,
     path: config.media.path,
+    authToken: config.media.authToken,
     onLog: hooks.onLog,
   });
 

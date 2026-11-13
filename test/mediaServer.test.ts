@@ -56,14 +56,14 @@ describe('MediaServer', () => {
       JSON.stringify({
         event: 'start',
         streamSid: 'MZ1',
-        start: { callSid: 'CA1', customParameters: { from: '+4915100000001', to: '+4921193674951' } },
+        start: { callSid: 'CA1', customParameters: { from: '+493012340001', to: '+493012340002' } },
       }),
     );
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(server.registry.size).toBe(1);
-    expect(calls[0]).toEqual({ from: '+4915100000001', to: '+4921193674951' });
-    expect(server.registry.get('MZ1')?.from).toBe('+4915100000001');
+    expect(calls[0]).toEqual({ from: '+493012340001', to: '+493012340002' });
+    expect(server.registry.get('MZ1')?.from).toBe('+493012340001');
     socket.close();
   });
 
@@ -126,5 +126,37 @@ describe('MediaServer', () => {
     const port = first.address?.port as number;
     const second = new MediaServer({ host: '127.0.0.1', port, path: '/sip/media' });
     await expect(second.start()).rejects.toThrow();
+  });
+
+  it('enforces authToken on incoming connections when configured', async () => {
+    const secret = 'super-secret-auth-token-12345';
+    const server = new MediaServer({ host: '127.0.0.1', port: 0, path: '/sip/media', authToken: secret });
+    servers.push(server);
+    await server.start();
+    const port = server.address?.port;
+
+    await expect(new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/sip/media`);
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    })).rejects.toThrow(/401/);
+
+    const authedWs = await new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/sip/media?token=${secret}`);
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    });
+    expect(authedWs.readyState).toBe(WebSocket.OPEN);
+    authedWs.close();
+
+    const bearerWs = await new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/sip/media`, {
+        headers: { Authorization: `Bearer ${secret}` },
+      });
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    });
+    expect(bearerWs.readyState).toBe(WebSocket.OPEN);
+    bearerWs.close();
   });
 });

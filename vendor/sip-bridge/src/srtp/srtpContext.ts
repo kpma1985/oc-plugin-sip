@@ -89,6 +89,10 @@ export class SrtpContext {
   private roc = 0;
   private lastSeq = -1;
 
+  // RFC 3711 §3.3.2 64-packet replay window for decryption
+  private replayMaxIndex = -1n;
+  private replayWindow = 0n; // bitmask of received packets relative to replayMaxIndex
+
   /**
    * Create an SRTP context for a single direction.
    *
@@ -165,6 +169,11 @@ export class SrtpContext {
       throw new Error('SRTP decrypt: authentication tag mismatch');
     }
 
+    // RFC 3711 §3.3.2 anti-replay protection (64-packet sliding window)
+    if (!this.checkAndUpdateReplay(packetIndex)) {
+      throw new Error('SRTP decrypt: replayed packet dropped');
+    }
+
     const headerLen = this.rtpHeaderLength(encPacket);
     const header    = encPacket.subarray(0, headerLen);
     const encPayload = encPacket.subarray(headerLen);
@@ -222,5 +231,35 @@ export class SrtpContext {
       len += 4 + pkt.readUInt16BE(len + 2) * 4;
     }
     return len;
+  }
+
+  /**
+   * RFC 3711 §3.3.2 anti-replay check and window advance for decryption.
+   * Returns true when the packet index is accepted, false for a duplicate or
+   * a packet older than the 64-packet window (replay or stale delivery).
+   */
+  private checkAndUpdateReplay(index: bigint): boolean {
+    if (this.replayMaxIndex < 0n) {
+      this.replayMaxIndex = index;
+      this.replayWindow = 1n;
+      return true;
+    }
+
+    const diff = index - this.replayMaxIndex;
+    if (diff > 0n) {
+      // Packet is newer than the current max index: advance the window.
+      this.replayWindow = diff >= 64n ? 1n : (this.replayWindow << diff) | 1n;
+      this.replayMaxIndex = index;
+      return true;
+    }
+
+    const behind = -diff;
+    if (behind >= 64n) return false; // older than the 64-packet window
+
+    const mask = 1n << behind;
+    if ((this.replayWindow & mask) !== 0n) return false; // already seen
+
+    this.replayWindow |= mask;
+    return true;
   }
 }

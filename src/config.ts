@@ -61,6 +61,7 @@ export const sipConfigSchema = z.object({
       path: z.string().default('/sip/media'),
       rtpPortMin: z.number().int().min(1024).max(65534).default(10000),
       rtpPortMax: z.number().int().min(1025).max(65535).default(10099),
+      authToken: z.string().min(16).max(200).optional(),
     }).strict()
     .prefault({}),
   audio: z.object({ mode: z.enum(['twilio', 'best']).default('twilio') }).strict().prefault({}),
@@ -178,6 +179,12 @@ export function validateForTransport(config: SipPluginConfig): string[] {
   }
   if (config.media.rtpPortMax <= config.media.rtpPortMin) {
     problems.push('media.rtpPortMax must be > media.rtpPortMin');
+  }
+  if (config.inbound.pin.enabled && !config.inbound.pin.code) {
+    problems.push('inbound.pin.code is required when inbound.pin.enabled is true');
+  }
+  if (config.media.host !== '127.0.0.1' && config.media.host !== 'localhost' && !config.media.authToken) {
+    problems.push('media.authToken is required when media.host is not loopback, to prevent unauthenticated media connections');
   }
   if (config.voice.enabled && config.voice.engine === 'deepgram-agent') {
     const agent = config.voice.agent;

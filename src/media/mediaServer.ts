@@ -27,6 +27,7 @@ export interface MediaServerOptions {
   host: string;
   port: number;
   path: string;
+  authToken?: string;
   onLog?: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -56,7 +57,37 @@ export class MediaServer extends EventEmitter<MediaServerEvents> {
     if (this.server) return Promise.resolve();
     const { host, port, path } = this.options;
     return new Promise((resolve, reject) => {
-      const server = new WebSocketServer({ host, port, path });
+      const server = new WebSocketServer({
+        host,
+        port,
+        path,
+        verifyClient: (info, callback) => {
+          if (!this.options.authToken) {
+            callback(true);
+            return;
+          }
+          const authHeader = info.req.headers['authorization'];
+          let token: string | undefined;
+          if (authHeader?.startsWith('Bearer ')) {
+            token = authHeader.slice(7).trim();
+          } else {
+            try {
+              const parsedUrl = new URL(info.req.url ?? '', `http://${info.req.headers.host ?? 'localhost'}`);
+              token = parsedUrl.searchParams.get('token') ?? undefined;
+            } catch {
+              // bad url
+            }
+          }
+          if (token && token === this.options.authToken) {
+            callback(true);
+          } else {
+            this.options.onLog?.('media-unauthorized', {
+              remote: info.req.socket.remoteAddress ?? 'unknown',
+            });
+            callback(false, 401, 'Unauthorized');
+          }
+        },
+      });
       server.once('listening', () => {
         this.server = server;
         resolve();

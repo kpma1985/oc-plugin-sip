@@ -250,6 +250,12 @@
                 "minimum": 1025,
                 "maximum": 65535,
                 "description": "Must be strictly greater than rtpPortMin (runtime cross-field validation)."
+              },
+              "authToken": {
+                "type": "string",
+                "minLength": 16,
+                "maxLength": 200,
+                "description": "Shared secret required on the media WebSocket endpoint (Bearer token or ?token=). Strongly recommended when media.host is not loopback."
               }
             }
           },
@@ -904,6 +910,10 @@
         "inbound.pin.timeoutMs": {
           "label": "PIN entry timeout (ms)",
           "advanced": true
+        },
+        "media.authToken": {
+          "label": "Media endpoint auth token",
+          "help": "Optional secret required for attaching to the media WebSocket. Protects the media server against unauthorized stream injection."
         }
       }
     }
@@ -1204,6 +1214,10 @@
     "inbound.pin.timeoutMs": {
       "label": "PIN entry timeout (ms)",
       "advanced": true
+    },
+    "media.authToken": {
+      "label": "Media endpoint auth token",
+      "help": "Optional secret required for attaching to the media WebSocket. Protects the media server against unauthorized stream injection."
     }
   },
   "configSchema": {
@@ -1439,6 +1453,12 @@
             "minimum": 1025,
             "maximum": 65535,
             "description": "Must be strictly greater than rtpPortMin (runtime cross-field validation)."
+          },
+          "authToken": {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 200,
+            "description": "Shared secret required on the media WebSocket endpoint (Bearer token or ?token=). Strongly recommended when media.host is not loopback."
           }
         }
       },

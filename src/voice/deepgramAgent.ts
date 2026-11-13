@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import type { CallSession } from '../media/callSession.js';
 import type { SipPluginConfig } from '../config.js';
 import type { UtteranceHook } from './voiceCall.js';
+import { speakAnnouncement, type VoiceDependencies } from './voiceCall.js';
 
 export type AgentLog = (event: string, fields?: Record<string, unknown>) => void;
 
@@ -91,6 +92,11 @@ export class DeepgramAgentCall implements VoiceEngine {
   private remainder = Buffer.alloc(0);
   private readonly tasks = new AbortController();
 
+  // DTMF PIN gate (same semantics as VoiceCall)
+  private pinAuthenticated = false;
+  private pinState: { digits: string; attempts: number } | null = null;
+  private pinTimeout: NodeJS.Timeout | undefined;
+
   constructor(private session: CallSession, private config: SipPluginConfig,
     private log?: AgentLog, dependencies: DeepgramAgentDependencies = {},
     private utterance?: UtteranceHook) {
@@ -108,10 +114,77 @@ export class DeepgramAgentCall implements VoiceEngine {
     this.socket.on('open', () => clearTimeout(this.connectTimer));
     this.socket.on('message', (data, isBinary) => this.message(data, isBinary));
     this.log?.('agent-connecting', { model: config.voice.agent.think.model, provider: config.voice.agent.think.provider });
+
+    // DTMF PIN gate: block caller audio until the code is confirmed.
+    const pin = config.inbound.pin;
+    if (pin.enabled && pin.code) {
+      this.pinState = { digits: '', attempts: 0 };
+      this.pinTimeout = setTimeout(() => {
+        if (this.stopped || this.pinAuthenticated) return;
+        this.speak(pin.lockoutText);
+        setTimeout(() => this.session.end('pin-timeout'), 3000);
+      }, pin.timeoutMs);
+      if (pin.promptText) this.speak(pin.promptText);
+    } else {
+      this.pinAuthenticated = true;
+    }
+  }
+
+  /** Caller keypad input; drives the DTMF PIN gate until authenticated. */
+  dtmf(digit: string): void {
+    if (this.stopped || this.pinAuthenticated) return;
+    const pin = this.config.inbound.pin;
+    if (!pin.enabled || !pin.code) return;
+    if (digit === '#') {
+      if ((this.pinState?.digits ?? '') === pin.code) {
+        clearTimeout(this.pinTimeout);
+        this.pinState = null;
+        this.pinAuthenticated = true;
+        this.log?.('pin-accepted');
+        return;
+      }
+      const attempts = (this.pinState?.attempts ?? 0) + 1;
+      if (attempts >= pin.maxAttempts) {
+        clearTimeout(this.pinTimeout);
+        this.log?.('pin-lockout', { attempts });
+        this.speak(pin.lockoutText);
+        setTimeout(() => this.session.end('pin-failed'), 3000);
+        return;
+      }
+      this.pinState = { digits: '', attempts };
+      this.log?.('pin-rejected', { attempts });
+      this.speak(pin.failureText);
+      return;
+    }
+    if (digit === '*') {
+      if (this.pinState) this.pinState.digits = '';
+      return;
+    }
+    if (!/^\d$/.test(digit)) return;
+    if (!this.pinState) this.pinState = { digits: '', attempts: 0 };
+    if (this.pinState.digits.length >= pin.maxDigits) return;
+    this.pinState.digits += digit;
+    if (this.pinState.digits.length === pin.maxDigits) this.dtmf('#');
+  }
+
+  /** Speak a short local prompt (PIN gate) without going through the agent turn. */
+  private speak(text: string): void {
+    if (this.stopped || !text) return;
+    void (async () => {
+      try {
+        await speakAnnouncement(this.session, this.config, text,
+          this.tasks.signal, () => !this.stopped);
+      } catch (error) {
+        this.log?.('agent-announcement-error', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
   }
 
   audio(audio: Uint8Array): void {
     if (this.stopped) return;
+    if (!this.pinAuthenticated) return;
     const input = this.session.media.codec === 'pcmu' ? audio : this.session.media.decode(audio);
     if (this.ready && this.socket.readyState === WebSocket.OPEN) { this.send(input); return; }
     if (this.pendingBytes + input.length > this.config.voice.maxInboundBytes) { this.fail('agent-pending-overflow'); return; }
@@ -217,6 +290,7 @@ export class DeepgramAgentCall implements VoiceEngine {
   stop(): void {
     if (this.stopped) return;
     this.stopped = true; this.tasks.abort();
+    if (this.pinTimeout) clearTimeout(this.pinTimeout);
     clearTimeout(this.connectTimer); if (this.keepalive) clearInterval(this.keepalive);
     this.pending = []; this.pendingBytes = 0;
     this.socket.terminate();

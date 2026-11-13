@@ -254,6 +254,12 @@ var openclaw_plugin_default = {
                 minimum: 1025,
                 maximum: 65535,
                 description: "Must be strictly greater than rtpPortMin (runtime cross-field validation)."
+              },
+              authToken: {
+                type: "string",
+                minLength: 16,
+                maxLength: 200,
+                description: "Shared secret required on the media WebSocket endpoint (Bearer token or ?token=). Strongly recommended when media.host is not loopback."
               }
             }
           },
@@ -908,6 +914,10 @@ var openclaw_plugin_default = {
         "inbound.pin.timeoutMs": {
           label: "PIN entry timeout (ms)",
           advanced: true
+        },
+        "media.authToken": {
+          label: "Media endpoint auth token",
+          help: "Optional secret required for attaching to the media WebSocket. Protects the media server against unauthorized stream injection."
         }
       }
     }
@@ -1208,6 +1218,10 @@ var openclaw_plugin_default = {
     "inbound.pin.timeoutMs": {
       label: "PIN entry timeout (ms)",
       advanced: true
+    },
+    "media.authToken": {
+      label: "Media endpoint auth token",
+      help: "Optional secret required for attaching to the media WebSocket. Protects the media server against unauthorized stream injection."
     }
   },
   configSchema: {
@@ -1443,6 +1457,12 @@ var openclaw_plugin_default = {
             minimum: 1025,
             maximum: 65535,
             description: "Must be strictly greater than rtpPortMin (runtime cross-field validation)."
+          },
+          authToken: {
+            type: "string",
+            minLength: 16,
+            maxLength: 200,
+            description: "Shared secret required on the media WebSocket endpoint (Bearer token or ?token=). Strongly recommended when media.host is not loopback."
           }
         }
       },
@@ -1915,7 +1935,8 @@ var sipConfigSchema = z.object({
     port: z.number().int().min(1).max(65535).default(8080),
     path: z.string().default("/sip/media"),
     rtpPortMin: z.number().int().min(1024).max(65534).default(1e4),
-    rtpPortMax: z.number().int().min(1025).max(65535).default(10099)
+    rtpPortMax: z.number().int().min(1025).max(65535).default(10099),
+    authToken: z.string().min(16).max(200).optional()
   }).strict().prefault({}),
   audio: z.object({ mode: z.enum(["twilio", "best"]).default("twilio") }).strict().prefault({}),
   inbound: z.object({
@@ -2020,6 +2041,12 @@ function validateForTransport(config) {
   }
   if (config.media.rtpPortMax <= config.media.rtpPortMin) {
     problems.push("media.rtpPortMax must be > media.rtpPortMin");
+  }
+  if (config.inbound.pin.enabled && !config.inbound.pin.code) {
+    problems.push("inbound.pin.code is required when inbound.pin.enabled is true");
+  }
+  if (config.media.host !== "127.0.0.1" && config.media.host !== "localhost" && !config.media.authToken) {
+    problems.push("media.authToken is required when media.host is not loopback, to prevent unauthenticated media connections");
   }
   if (config.voice.enabled && config.voice.engine === "deepgram-agent") {
     const agent = config.voice.agent;
@@ -2630,7 +2657,36 @@ var MediaServer = class extends EventEmitter {
     if (this.server) return Promise.resolve();
     const { host, port, path } = this.options;
     return new Promise((resolve, reject) => {
-      const server = new WebSocketServer({ host, port, path });
+      const server = new WebSocketServer({
+        host,
+        port,
+        path,
+        verifyClient: (info, callback) => {
+          if (!this.options.authToken) {
+            callback(true);
+            return;
+          }
+          const authHeader = info.req.headers["authorization"];
+          let token;
+          if (authHeader?.startsWith("Bearer ")) {
+            token = authHeader.slice(7).trim();
+          } else {
+            try {
+              const parsedUrl = new URL(info.req.url ?? "", `http://${info.req.headers.host ?? "localhost"}`);
+              token = parsedUrl.searchParams.get("token") ?? void 0;
+            } catch {
+            }
+          }
+          if (token && token === this.options.authToken) {
+            callback(true);
+          } else {
+            this.options.onLog?.("media-unauthorized", {
+              remote: info.req.socket.remoteAddress ?? "unknown"
+            });
+            callback(false, 401, "Unauthorized");
+          }
+        }
+      });
       server.once("listening", () => {
         this.server = server;
         resolve();
@@ -2813,6 +2869,10 @@ var SrtpContext = class {
   // Per-direction packet index tracking (ROC + SEQ → 48-bit packet index)
   roc = 0;
   lastSeq = -1;
+  // RFC 3711 §3.3.2 64-packet replay window for decryption
+  replayMaxIndex = -1n;
+  replayWindow = 0n;
+  // bitmask of received packets relative to replayMaxIndex
   /**
    * Create an SRTP context for a single direction.
    *
@@ -2874,6 +2934,9 @@ var SrtpContext = class {
     if (!expectedTag.equals(receivedTag)) {
       throw new Error("SRTP decrypt: authentication tag mismatch");
     }
+    if (!this.checkAndUpdateReplay(packetIndex)) {
+      throw new Error("SRTP decrypt: replayed packet dropped");
+    }
     const headerLen = this.rtpHeaderLength(encPacket);
     const header = encPacket.subarray(0, headerLen);
     const encPayload = encPacket.subarray(headerLen);
@@ -2919,6 +2982,30 @@ var SrtpContext = class {
       len += 4 + pkt.readUInt16BE(len + 2) * 4;
     }
     return len;
+  }
+  /**
+   * RFC 3711 §3.3.2 anti-replay check and window advance for decryption.
+   * Returns true when the packet index is accepted, false for a duplicate or
+   * a packet older than the 64-packet window (replay or stale delivery).
+   */
+  checkAndUpdateReplay(index) {
+    if (this.replayMaxIndex < 0n) {
+      this.replayMaxIndex = index;
+      this.replayWindow = 1n;
+      return true;
+    }
+    const diff = index - this.replayMaxIndex;
+    if (diff > 0n) {
+      this.replayWindow = diff >= 64n ? 1n : this.replayWindow << diff | 1n;
+      this.replayMaxIndex = index;
+      return true;
+    }
+    const behind = -diff;
+    if (behind >= 64n) return false;
+    const mask = 1n << behind;
+    if ((this.replayWindow & mask) !== 0n) return false;
+    this.replayWindow |= mask;
+    return true;
   }
 };
 
@@ -5461,7 +5548,7 @@ function mapEmbeddedConfig(config, address) {
     RTP_PORT_MAX: config.media.rtpPortMax,
     SRTP_ENABLED: config.sip.srtp,
     AUDIO_MODE: config.audio.mode,
-    WS_TARGET_URL: `ws://${host}:${address.port}${config.media.path}`,
+    WS_TARGET_URL: `ws://${host}:${address.port}${config.media.path}${config.media.authToken ? `?token=${encodeURIComponent(config.media.authToken)}` : ""}`,
     SIP_EXPIRES: 120,
     SIP_OPTIONS_INTERVAL: 30,
     LOG_LEVEL: "info",
@@ -5548,248 +5635,10 @@ async function startEmbeddedTransport(config, address, onLog, overrides = {}) {
 }
 
 // src/voice/deepgramAgent.ts
-import WebSocket2 from "ws";
-var OPENCLAW_TASK = {
-  name: "openclaw_task",
-  description: "Run a task with the OpenClaw agent tools (lookups, research, actions) and return the result as a short spoken sentence.",
-  parameters: {
-    type: "object",
-    properties: { request: { type: "string", description: "The caller's request as a complete sentence." } },
-    required: ["request"]
-  }
-};
-var CONNECT_TIMEOUT_MS = 1e4;
-var KEEPALIVE_MS = 4e3;
-function buildSettings(config, codec, sampleRate) {
-  const agent = config.voice.agent;
-  const encoding = codec === "pcmu" ? "mulaw" : "linear16";
-  const think = {
-    provider: {
-      type: agent.think.provider,
-      model: agent.think.model,
-      ...agent.think.temperature !== void 0 ? { temperature: agent.think.temperature } : {}
-    },
-    prompt: agent.prompt,
-    ...agent.tools ? { functions: [OPENCLAW_TASK] } : {}
-  };
-  if (agent.think.endpoint) think.endpoint = { url: agent.think.endpoint.url, headers: agent.think.endpoint.headers };
-  const greeting = agent.greeting ?? config.inbound.greeting;
-  return {
-    type: "Settings",
-    audio: {
-      input: { encoding, sample_rate: sampleRate },
-      output: { encoding, sample_rate: sampleRate, container: "none" }
-    },
-    agent: {
-      listen: {
-        provider: {
-          type: "deepgram",
-          model: config.stt.model,
-          language: config.stt.language,
-          ...config.stt.keyterms.length ? { keyterms: config.stt.keyterms } : {}
-        }
-      },
-      think,
-      speak: config.tts.provider === "elevenlabs" ? {
-        provider: { type: "eleven_labs", model_id: config.tts.model },
-        endpoint: {
-          url: config.tts.model === "eleven_v3" ? `${config.tts.baseUrl.replace(/\/$/, "")}/v1/text-to-speech/${encodeURIComponent(config.tts.voice)}` : `${config.tts.baseUrl.replace(/^https:/, "wss:").replace(/\/$/, "")}/v1/text-to-speech/${encodeURIComponent(config.tts.voice)}/multi-stream-input`,
-          headers: { "xi-api-key": config.tts.apiKey }
-        }
-      } : { provider: { type: "deepgram", model: config.tts.voice ?? config.tts.model } },
-      ...greeting ? { greeting } : {}
-    }
-  };
-}
-var DeepgramAgentCall = class {
-  constructor(session, config, log, dependencies = {}, utterance) {
-    this.session = session;
-    this.config = config;
-    this.log = log;
-    this.utterance = utterance;
-    session.setQueueLimit(config.voice.maxOutboundBytes);
-    session.setPlaybackPrebuffer(config.voice.playbackPrebufferMs);
-    const url = new URL(dependencies.agentUrl ?? `${config.voice.agent.baseUrl.replace(/\/$/, "")}/v1/agent/converse`);
-    this.socket = new WebSocket2(url, {
-      headers: { Authorization: `Token ${config.stt.apiKey}` },
-      handshakeTimeout: CONNECT_TIMEOUT_MS,
-      maxPayload: 1048576
-    });
-    this.connectTimer = setTimeout(() => this.fail("agent-connect-timeout"), CONNECT_TIMEOUT_MS);
-    this.socket.on("error", (error) => this.fail("agent-socket-error", error.message));
-    this.socket.on("close", () => {
-      if (!this.stopped) this.fail("agent-socket-closed");
-    });
-    this.socket.on("open", () => clearTimeout(this.connectTimer));
-    this.socket.on("message", (data, isBinary) => this.message(data, isBinary));
-    this.log?.("agent-connecting", { model: config.voice.agent.think.model, provider: config.voice.agent.think.provider });
-  }
-  session;
-  config;
-  log;
-  utterance;
-  socket;
-  connectTimer;
-  keepalive;
-  ready = false;
-  stopped = false;
-  playing = true;
-  turn = 0;
-  pending = [];
-  pendingBytes = 0;
-  remainder = Buffer.alloc(0);
-  tasks = new AbortController();
-  audio(audio) {
-    if (this.stopped) return;
-    const input = this.session.media.codec === "pcmu" ? audio : this.session.media.decode(audio);
-    if (this.ready && this.socket.readyState === WebSocket2.OPEN) {
-      this.send(input);
-      return;
-    }
-    if (this.pendingBytes + input.length > this.config.voice.maxInboundBytes) {
-      this.fail("agent-pending-overflow");
-      return;
-    }
-    this.pending.push(Buffer.from(input));
-    this.pendingBytes += input.length;
-  }
-  send(audio) {
-    if (this.stopped) return;
-    if (this.socket.bufferedAmount + audio.length > this.config.voice.maxInboundBytes) {
-      this.fail("agent-buffer-overflow");
-      return;
-    }
-    this.socket.send(audio, { binary: true }, (error) => {
-      if (error) this.fail("agent-send-failed");
-    });
-  }
-  message(data, isBinary) {
-    if (this.stopped) return;
-    if (isBinary) {
-      if (!this.playing) return;
-      try {
-        this.play(Buffer.from(data));
-      } catch {
-        this.fail("agent-playback-overflow");
-      }
-      return;
-    }
-    let event;
-    try {
-      event = JSON.parse(String(data));
-    } catch {
-      this.fail("agent-bad-message");
-      return;
-    }
-    switch (event.type) {
-      case "Welcome":
-        this.socket.send(
-          JSON.stringify(buildSettings(this.config, this.session.media.codec, this.session.media.sampleRate)),
-          (error) => {
-            if (error) this.fail("agent-settings-failed");
-          }
-        );
-        break;
-      case "SettingsApplied":
-        this.ready = true;
-        for (const chunk of this.pending) this.send(chunk);
-        this.pending = [];
-        this.pendingBytes = 0;
-        this.keepalive = setInterval(() => {
-          if (this.socket.readyState === WebSocket2.OPEN) this.socket.send(JSON.stringify({ type: "KeepAlive" }));
-        }, KEEPALIVE_MS);
-        this.log?.("agent-ready");
-        break;
-      case "UserStartedSpeaking":
-        this.log?.("user-speaking");
-        this.playing = false;
-        this.remainder = Buffer.alloc(0);
-        this.session.interrupt();
-        break;
-      case "AgentStartedSpeaking":
-        this.playing = true;
-        this.log?.("tts-start", { turn: this.turn });
-        break;
-      case "AgentAudioDone":
-        this.playing = true;
-        this.remainder = Buffer.alloc(0);
-        try {
-          this.session.mark(`agent-${this.turn++}`);
-        } catch {
-          this.fail("agent-mark-overflow");
-        }
-        this.log?.("tts-end", { turn: this.turn - 1 });
-        break;
-      case "FunctionCallRequest":
-        for (const call of event.functions ?? []) void this.callFunction(call);
-        break;
-      case "Error":
-        this.fail("agent-error-event", event.code ?? event.description);
-        break;
-      case "ConversationText":
-        if (event.role === "assistant") {
-          this.playing = true;
-          this.log?.("tts-start", { turn: this.turn });
-        }
-        this.log?.("agent-text", { role: event.role, content: (event.content ?? "").slice(0, 200) });
-        break;
-      case "AgentThinking":
-        this.log?.("agent-thinking");
-        break;
-      case "Warning":
-      case "InjectionRefused":
-        this.log?.("agent-warning", { type: event.type, description: event.description });
-        break;
-    }
-  }
-  async callFunction(call) {
-    if (call.client_side === false) return;
-    let content;
-    const started = Date.now();
-    try {
-      if (call.name !== OPENCLAW_TASK.name || !this.config.voice.agent.tools || !this.utterance) throw new Error("unknown function");
-      const request = String(JSON.parse(call.arguments ?? "{}").request ?? "").trim();
-      if (!request) throw new Error("empty request");
-      content = (await this.utterance(request, this.tasks.signal, this.session)).slice(0, 4096) || "No answer.";
-      this.log?.("agent-function", { name: call.name, ms: Date.now() - started, chars: content.length, preview: content.slice(0, 160) });
-    } catch (error) {
-      content = "The task could not be completed.";
-      this.log?.("agent-function-error", { name: call.name, message: error instanceof Error ? error.message : String(error) });
-    }
-    if (this.stopped || this.socket.readyState !== WebSocket2.OPEN) return;
-    this.socket.send(JSON.stringify({ type: "FunctionCallResponse", id: call.id, name: call.name, content }));
-  }
-  play(chunk) {
-    if (this.session.media.codec === "pcmu") {
-      this.session.sendAudioChunk(chunk);
-      return;
-    }
-    const data = Buffer.concat([this.remainder, chunk]);
-    const alignment = this.session.media.codec === "g722" ? 4 : 2;
-    const length = data.length - data.length % alignment;
-    if (length) this.session.sendAudioChunk(this.session.media.encode(data.subarray(0, length)));
-    this.remainder = Buffer.from(data.subarray(length));
-  }
-  fail(reason, detail) {
-    if (this.stopped) return;
-    this.log?.("voice-error", { reason, ...detail ? { detail } : {} });
-    this.stop();
-    this.session.end("voice-error");
-  }
-  stop() {
-    if (this.stopped) return;
-    this.stopped = true;
-    this.tasks.abort();
-    clearTimeout(this.connectTimer);
-    if (this.keepalive) clearInterval(this.keepalive);
-    this.pending = [];
-    this.pendingBytes = 0;
-    this.socket.terminate();
-  }
-};
+import WebSocket3 from "ws";
 
 // src/voice/voiceCall.ts
-import WebSocket3 from "ws";
+import WebSocket2 from "ws";
 
 // src/voice/textLimits.ts
 var MAX_VOICE_REPLY_CHARS = 32768;
@@ -5850,7 +5699,7 @@ var VoiceCall = class {
     };
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     for (const term of config.stt.keyterms) url.searchParams.append("keyterm", term);
-    this.socket = new WebSocket3(url, {
+    this.socket = new WebSocket2(url, {
       headers: { Authorization: `Token ${config.stt.apiKey}` },
       handshakeTimeout: config.stt.connectionTimeoutMs,
       maxPayload: 65536
@@ -5959,7 +5808,7 @@ var VoiceCall = class {
     if (this.stopped) return;
     if (!this.pinAuthenticated) return;
     const input = this.session.media.codec === "pcmu" ? audio : this.session.media.decode(audio);
-    if (this.socket.readyState === WebSocket3.OPEN) {
+    if (this.socket.readyState === WebSocket2.OPEN) {
       this.send(input);
       return;
     }
@@ -6167,6 +6016,319 @@ async function speakAnnouncement(session, config, text2, parent, current, depend
     await reader?.cancel().catch(() => void 0);
   }
 }
+
+// src/voice/deepgramAgent.ts
+var OPENCLAW_TASK = {
+  name: "openclaw_task",
+  description: "Run a task with the OpenClaw agent tools (lookups, research, actions) and return the result as a short spoken sentence.",
+  parameters: {
+    type: "object",
+    properties: { request: { type: "string", description: "The caller's request as a complete sentence." } },
+    required: ["request"]
+  }
+};
+var CONNECT_TIMEOUT_MS = 1e4;
+var KEEPALIVE_MS = 4e3;
+function buildSettings(config, codec, sampleRate) {
+  const agent = config.voice.agent;
+  const encoding = codec === "pcmu" ? "mulaw" : "linear16";
+  const think = {
+    provider: {
+      type: agent.think.provider,
+      model: agent.think.model,
+      ...agent.think.temperature !== void 0 ? { temperature: agent.think.temperature } : {}
+    },
+    prompt: agent.prompt,
+    ...agent.tools ? { functions: [OPENCLAW_TASK] } : {}
+  };
+  if (agent.think.endpoint) think.endpoint = { url: agent.think.endpoint.url, headers: agent.think.endpoint.headers };
+  const greeting = agent.greeting ?? config.inbound.greeting;
+  return {
+    type: "Settings",
+    audio: {
+      input: { encoding, sample_rate: sampleRate },
+      output: { encoding, sample_rate: sampleRate, container: "none" }
+    },
+    agent: {
+      listen: {
+        provider: {
+          type: "deepgram",
+          model: config.stt.model,
+          language: config.stt.language,
+          ...config.stt.keyterms.length ? { keyterms: config.stt.keyterms } : {}
+        }
+      },
+      think,
+      speak: config.tts.provider === "elevenlabs" ? {
+        provider: { type: "eleven_labs", model_id: config.tts.model },
+        endpoint: {
+          url: config.tts.model === "eleven_v3" ? `${config.tts.baseUrl.replace(/\/$/, "")}/v1/text-to-speech/${encodeURIComponent(config.tts.voice)}` : `${config.tts.baseUrl.replace(/^https:/, "wss:").replace(/\/$/, "")}/v1/text-to-speech/${encodeURIComponent(config.tts.voice)}/multi-stream-input`,
+          headers: { "xi-api-key": config.tts.apiKey }
+        }
+      } : { provider: { type: "deepgram", model: config.tts.voice ?? config.tts.model } },
+      ...greeting ? { greeting } : {}
+    }
+  };
+}
+var DeepgramAgentCall = class {
+  constructor(session, config, log, dependencies = {}, utterance) {
+    this.session = session;
+    this.config = config;
+    this.log = log;
+    this.utterance = utterance;
+    session.setQueueLimit(config.voice.maxOutboundBytes);
+    session.setPlaybackPrebuffer(config.voice.playbackPrebufferMs);
+    const url = new URL(dependencies.agentUrl ?? `${config.voice.agent.baseUrl.replace(/\/$/, "")}/v1/agent/converse`);
+    this.socket = new WebSocket3(url, {
+      headers: { Authorization: `Token ${config.stt.apiKey}` },
+      handshakeTimeout: CONNECT_TIMEOUT_MS,
+      maxPayload: 1048576
+    });
+    this.connectTimer = setTimeout(() => this.fail("agent-connect-timeout"), CONNECT_TIMEOUT_MS);
+    this.socket.on("error", (error) => this.fail("agent-socket-error", error.message));
+    this.socket.on("close", () => {
+      if (!this.stopped) this.fail("agent-socket-closed");
+    });
+    this.socket.on("open", () => clearTimeout(this.connectTimer));
+    this.socket.on("message", (data, isBinary) => this.message(data, isBinary));
+    this.log?.("agent-connecting", { model: config.voice.agent.think.model, provider: config.voice.agent.think.provider });
+    const pin = config.inbound.pin;
+    if (pin.enabled && pin.code) {
+      this.pinState = { digits: "", attempts: 0 };
+      this.pinTimeout = setTimeout(() => {
+        if (this.stopped || this.pinAuthenticated) return;
+        this.speak(pin.lockoutText);
+        setTimeout(() => this.session.end("pin-timeout"), 3e3);
+      }, pin.timeoutMs);
+      if (pin.promptText) this.speak(pin.promptText);
+    } else {
+      this.pinAuthenticated = true;
+    }
+  }
+  session;
+  config;
+  log;
+  utterance;
+  socket;
+  connectTimer;
+  keepalive;
+  ready = false;
+  stopped = false;
+  playing = true;
+  turn = 0;
+  pending = [];
+  pendingBytes = 0;
+  remainder = Buffer.alloc(0);
+  tasks = new AbortController();
+  // DTMF PIN gate (same semantics as VoiceCall)
+  pinAuthenticated = false;
+  pinState = null;
+  pinTimeout;
+  /** Caller keypad input; drives the DTMF PIN gate until authenticated. */
+  dtmf(digit) {
+    if (this.stopped || this.pinAuthenticated) return;
+    const pin = this.config.inbound.pin;
+    if (!pin.enabled || !pin.code) return;
+    if (digit === "#") {
+      if ((this.pinState?.digits ?? "") === pin.code) {
+        clearTimeout(this.pinTimeout);
+        this.pinState = null;
+        this.pinAuthenticated = true;
+        this.log?.("pin-accepted");
+        return;
+      }
+      const attempts = (this.pinState?.attempts ?? 0) + 1;
+      if (attempts >= pin.maxAttempts) {
+        clearTimeout(this.pinTimeout);
+        this.log?.("pin-lockout", { attempts });
+        this.speak(pin.lockoutText);
+        setTimeout(() => this.session.end("pin-failed"), 3e3);
+        return;
+      }
+      this.pinState = { digits: "", attempts };
+      this.log?.("pin-rejected", { attempts });
+      this.speak(pin.failureText);
+      return;
+    }
+    if (digit === "*") {
+      if (this.pinState) this.pinState.digits = "";
+      return;
+    }
+    if (!/^\d$/.test(digit)) return;
+    if (!this.pinState) this.pinState = { digits: "", attempts: 0 };
+    if (this.pinState.digits.length >= pin.maxDigits) return;
+    this.pinState.digits += digit;
+    if (this.pinState.digits.length === pin.maxDigits) this.dtmf("#");
+  }
+  /** Speak a short local prompt (PIN gate) without going through the agent turn. */
+  speak(text2) {
+    if (this.stopped || !text2) return;
+    void (async () => {
+      try {
+        await speakAnnouncement(
+          this.session,
+          this.config,
+          text2,
+          this.tasks.signal,
+          () => !this.stopped
+        );
+      } catch (error) {
+        this.log?.("agent-announcement-error", {
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    })();
+  }
+  audio(audio) {
+    if (this.stopped) return;
+    if (!this.pinAuthenticated) return;
+    const input = this.session.media.codec === "pcmu" ? audio : this.session.media.decode(audio);
+    if (this.ready && this.socket.readyState === WebSocket3.OPEN) {
+      this.send(input);
+      return;
+    }
+    if (this.pendingBytes + input.length > this.config.voice.maxInboundBytes) {
+      this.fail("agent-pending-overflow");
+      return;
+    }
+    this.pending.push(Buffer.from(input));
+    this.pendingBytes += input.length;
+  }
+  send(audio) {
+    if (this.stopped) return;
+    if (this.socket.bufferedAmount + audio.length > this.config.voice.maxInboundBytes) {
+      this.fail("agent-buffer-overflow");
+      return;
+    }
+    this.socket.send(audio, { binary: true }, (error) => {
+      if (error) this.fail("agent-send-failed");
+    });
+  }
+  message(data, isBinary) {
+    if (this.stopped) return;
+    if (isBinary) {
+      if (!this.playing) return;
+      try {
+        this.play(Buffer.from(data));
+      } catch {
+        this.fail("agent-playback-overflow");
+      }
+      return;
+    }
+    let event;
+    try {
+      event = JSON.parse(String(data));
+    } catch {
+      this.fail("agent-bad-message");
+      return;
+    }
+    switch (event.type) {
+      case "Welcome":
+        this.socket.send(
+          JSON.stringify(buildSettings(this.config, this.session.media.codec, this.session.media.sampleRate)),
+          (error) => {
+            if (error) this.fail("agent-settings-failed");
+          }
+        );
+        break;
+      case "SettingsApplied":
+        this.ready = true;
+        for (const chunk of this.pending) this.send(chunk);
+        this.pending = [];
+        this.pendingBytes = 0;
+        this.keepalive = setInterval(() => {
+          if (this.socket.readyState === WebSocket3.OPEN) this.socket.send(JSON.stringify({ type: "KeepAlive" }));
+        }, KEEPALIVE_MS);
+        this.log?.("agent-ready");
+        break;
+      case "UserStartedSpeaking":
+        this.log?.("user-speaking");
+        this.playing = false;
+        this.remainder = Buffer.alloc(0);
+        this.session.interrupt();
+        break;
+      case "AgentStartedSpeaking":
+        this.playing = true;
+        this.log?.("tts-start", { turn: this.turn });
+        break;
+      case "AgentAudioDone":
+        this.playing = true;
+        this.remainder = Buffer.alloc(0);
+        try {
+          this.session.mark(`agent-${this.turn++}`);
+        } catch {
+          this.fail("agent-mark-overflow");
+        }
+        this.log?.("tts-end", { turn: this.turn - 1 });
+        break;
+      case "FunctionCallRequest":
+        for (const call of event.functions ?? []) void this.callFunction(call);
+        break;
+      case "Error":
+        this.fail("agent-error-event", event.code ?? event.description);
+        break;
+      case "ConversationText":
+        if (event.role === "assistant") {
+          this.playing = true;
+          this.log?.("tts-start", { turn: this.turn });
+        }
+        this.log?.("agent-text", { role: event.role, content: (event.content ?? "").slice(0, 200) });
+        break;
+      case "AgentThinking":
+        this.log?.("agent-thinking");
+        break;
+      case "Warning":
+      case "InjectionRefused":
+        this.log?.("agent-warning", { type: event.type, description: event.description });
+        break;
+    }
+  }
+  async callFunction(call) {
+    if (call.client_side === false) return;
+    let content;
+    const started = Date.now();
+    try {
+      if (call.name !== OPENCLAW_TASK.name || !this.config.voice.agent.tools || !this.utterance) throw new Error("unknown function");
+      const request = String(JSON.parse(call.arguments ?? "{}").request ?? "").trim();
+      if (!request) throw new Error("empty request");
+      content = (await this.utterance(request, this.tasks.signal, this.session)).slice(0, 4096) || "No answer.";
+      this.log?.("agent-function", { name: call.name, ms: Date.now() - started, chars: content.length, preview: content.slice(0, 160) });
+    } catch (error) {
+      content = "The task could not be completed.";
+      this.log?.("agent-function-error", { name: call.name, message: error instanceof Error ? error.message : String(error) });
+    }
+    if (this.stopped || this.socket.readyState !== WebSocket3.OPEN) return;
+    this.socket.send(JSON.stringify({ type: "FunctionCallResponse", id: call.id, name: call.name, content }));
+  }
+  play(chunk) {
+    if (this.session.media.codec === "pcmu") {
+      this.session.sendAudioChunk(chunk);
+      return;
+    }
+    const data = Buffer.concat([this.remainder, chunk]);
+    const alignment = this.session.media.codec === "g722" ? 4 : 2;
+    const length = data.length - data.length % alignment;
+    if (length) this.session.sendAudioChunk(this.session.media.encode(data.subarray(0, length)));
+    this.remainder = Buffer.from(data.subarray(length));
+  }
+  fail(reason, detail) {
+    if (this.stopped) return;
+    this.log?.("voice-error", { reason, ...detail ? { detail } : {} });
+    this.stop();
+    this.session.end("voice-error");
+  }
+  stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.tasks.abort();
+    if (this.pinTimeout) clearTimeout(this.pinTimeout);
+    clearTimeout(this.connectTimer);
+    if (this.keepalive) clearInterval(this.keepalive);
+    this.pending = [];
+    this.pendingBytes = 0;
+    this.socket.terminate();
+  }
+};
 
 // src/voice/deepgramModels.ts
 import { createHmac as createHmac3, randomBytes as randomBytes4 } from "node:crypto";
@@ -6403,6 +6565,7 @@ async function startSipPlugin(rawConfig, hooks = {}, dependencies = {}) {
     host: config.media.host,
     port: config.media.port,
     path: config.media.path,
+    authToken: config.media.authToken,
     onLog: hooks.onLog
   });
   let embedded;

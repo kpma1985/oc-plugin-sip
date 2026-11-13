@@ -13,7 +13,7 @@ export function mapEmbeddedConfig(config: SipPluginConfig, address: { address: s
     SIP_LISTEN_ADDR: config.sip.listenAddr, SDP_CONTACT_IP: config.sip.publicIp,
     RTP_PORT_MIN: config.media.rtpPortMin, RTP_PORT_MAX: config.media.rtpPortMax,
     SRTP_ENABLED: config.sip.srtp, AUDIO_MODE: config.audio.mode,
-    WS_TARGET_URL: `ws://${host}:${address.port}${config.media.path}`,
+    WS_TARGET_URL: `ws://${host}:${address.port}${config.media.path}${config.media.authToken ? `?token=${encodeURIComponent(config.media.authToken)}` : ''}`,
     SIP_EXPIRES: 120, SIP_OPTIONS_INTERVAL: 30, LOG_LEVEL: 'info', HTTP_PORT: 9090,
     VOICE_URL: undefined, VOICE_METHOD: 'POST', VOICE_FALLBACK_URL: undefined,
     VOICE_FALLBACK_METHOD: 'POST', VOICE_TIMEOUT_S: 5,
