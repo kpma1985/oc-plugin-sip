@@ -1,5 +1,5 @@
 {
-  "name": "oc-plugin-sip",
+  "name": "@1337.so/oc-plugin-sip",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/plugin.js",
@@ -60,7 +60,7 @@
       "minGatewayVersion": "2026.9.9"
     }
   },
-  "homepage": "https://github.com/kpma1985/oc-plugin-sip",
+  "homepage": "https://1337.so",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kpma1985/oc-plugin-sip.git"

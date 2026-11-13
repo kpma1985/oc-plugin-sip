@@ -1,4 +1,4 @@
-# openclaw-sip
+# @1337.so/oc-plugin-sip
 
 Independent SIP telephony channel plugin for OpenClaw. Own SIP trunk, no
 Twilio account, no LiveKit, no dependency on the `voice-call` plugin.
@@ -45,7 +45,7 @@ side.
 ### Via ClawHub (recommended)
 
 ```bash
-openclaw plugins install clawhub:kpma1985/oc-plugin-sip
+openclaw plugins install clawhub:@1337.so/oc-plugin-sip
 ```
 
 ### From GitHub or local build
@@ -58,7 +58,7 @@ openclaw plugins install github:kpma1985/oc-plugin-sip
 npm install
 npm run build
 npm pack
-openclaw plugins install ./oc-plugin-sip-0.1.0.tgz
+openclaw plugins install ./1337.so-oc-plugin-sip-0.1.0.tgz
 ```
 ## System requirements
 
