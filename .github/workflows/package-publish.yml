@@ -46,7 +46,6 @@ jobs:
       - name: Publish to ClawHub
         run: |
           npx --yes clawhub@latest package publish . \
-            --owner 1337.so \
             --wait \
             ${{ inputs.dry_run && '--dry-run' || '' }}
         env:
