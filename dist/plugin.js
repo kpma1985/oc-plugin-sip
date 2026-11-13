@@ -221,6 +221,10 @@ var openclaw_plugin_default = {
               srtp: {
                 type: "boolean",
                 default: false
+              },
+              srtpRequired: {
+                type: "boolean",
+                default: false
               }
             }
           },
@@ -1424,6 +1428,10 @@ var openclaw_plugin_default = {
           srtp: {
             type: "boolean",
             default: false
+          },
+          srtpRequired: {
+            type: "boolean",
+            default: false
           }
         }
       },
@@ -1919,7 +1927,8 @@ var sipConfigSchema = z.object({
       "must be IPv4:port (1..65535)"
     ).default("0.0.0.0:5060"),
     publicIp: z.ipv4().optional(),
-    srtp: z.boolean().default(false)
+    srtp: z.boolean().default(false),
+    srtpRequired: z.boolean().default(false)
   }).strict().superRefine((sip, context) => {
     if (sip.preset !== "custom") return;
     for (const field of ["domain", "registrar"]) {
@@ -2828,14 +2837,14 @@ import * as dgram from "node:dgram";
 import { EventEmitter as EventEmitter2 } from "node:events";
 
 // vendor/sip-bridge/src/srtp/srtpContext.ts
-import { createCipheriv, createHmac } from "node:crypto";
+import { createCipheriv, createHmac, timingSafeEqual } from "node:crypto";
 var LABEL_ENC = 0;
 var LABEL_AUTH = 1;
 var LABEL_SALT = 2;
 function deriveKey(masterKey, masterSalt, label, length) {
   const iv = Buffer.alloc(16, 0);
-  masterSalt.copy(iv, 2);
-  iv[13] ^= label & 255;
+  masterSalt.copy(iv);
+  iv[7] ^= label;
   const blocks = Math.ceil(length / 16);
   const plaintext = Buffer.alloc(blocks * 16, 0);
   const cipher = createCipheriv("aes-128-ctr", masterKey, iv);
@@ -2843,19 +2852,14 @@ function deriveKey(masterKey, masterSalt, label, length) {
 }
 function computeIV(sessionSalt, ssrc, packetIndex) {
   const iv = Buffer.alloc(16, 0);
-  sessionSalt.copy(iv, 2);
+  sessionSalt.copy(iv);
   iv[4] ^= ssrc >>> 24 & 255;
   iv[5] ^= ssrc >>> 16 & 255;
   iv[6] ^= ssrc >>> 8 & 255;
   iv[7] ^= ssrc & 255;
-  const hi = Number(packetIndex >> 32n) & 65535;
-  const lo = Number(packetIndex & 0xffffffffn);
-  iv[10] ^= hi >> 8 & 255;
-  iv[11] ^= hi & 255;
-  iv[12] ^= lo >>> 24 & 255;
-  iv[13] ^= lo >>> 16 & 255;
-  iv[14] ^= lo >>> 8 & 255;
-  iv[15] ^= lo & 255;
+  for (let byte = 0; byte < 6; byte++) {
+    iv[13 - byte] ^= Number(packetIndex >> BigInt(byte * 8) & 0xffn);
+  }
   return iv;
 }
 var SEQ_WRAP_THRESHOLD = 32768;
@@ -2880,6 +2884,7 @@ var SrtpContext = class {
    * @param masterSalt 14-byte master salt (from the a=crypto: inline value)
    */
   constructor(masterKey, masterSalt) {
+    if (masterKey.length !== 16 || masterSalt.length !== 14) throw new Error("Invalid SRTP key length");
     this.encKey = deriveKey(masterKey, masterSalt, LABEL_ENC, 16);
     this.authKey = deriveKey(masterKey, masterSalt, LABEL_AUTH, 20);
     this.saltKey = deriveKey(masterKey, masterSalt, LABEL_SALT, 14);
@@ -2894,8 +2899,9 @@ var SrtpContext = class {
     if (rtpPacket.length < 12) throw new Error("SRTP encrypt: RTP packet too short");
     const ssrc = rtpPacket.readUInt32BE(8);
     const seq = rtpPacket.readUInt16BE(2);
-    const packetIndex = this.getOutboundPacketIndex(seq);
     const headerLen = this.rtpHeaderLength(rtpPacket);
+    this.validatePadding(rtpPacket, headerLen);
+    const packetIndex = this.getOutboundPacketIndex(seq);
     const header = rtpPacket.subarray(0, headerLen);
     const payload = rtpPacket.subarray(headerLen);
     const iv = computeIV(this.saltKey, ssrc, packetIndex);
@@ -2903,7 +2909,7 @@ var SrtpContext = class {
     const encryptedPayload = cipher.update(payload);
     const encPacket = Buffer.concat([header, encryptedPayload]);
     const rocBuf = Buffer.alloc(4);
-    rocBuf.writeUInt32BE(this.roc, 0);
+    rocBuf.writeUInt32BE(Number(packetIndex >> 16n), 0);
     const hmac = createHmac("sha1", this.authKey);
     hmac.update(encPacket);
     hmac.update(rocBuf);
@@ -2931,10 +2937,10 @@ var SrtpContext = class {
       return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: true };
     }
     if (diff > SEQ_WRAP_THRESHOLD) {
-      const candRoc = Math.max(0, this.roc - 1);
+      const candRoc = this.roc - 1;
       return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: false };
     }
-    return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: true };
+    return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: seq > this.lastSeq };
   }
   /**
    * Commit verified receiver state (ROC, lastSeq) only AFTER HMAC verification
@@ -2952,6 +2958,7 @@ var SrtpContext = class {
    */
   getOutboundPacketIndex(seq) {
     const est = this.estimateIndex(seq);
+    if (est.candidateRoc < 0 || est.candidateRoc > 4294967295) throw new Error("SRTP packet index exhausted or invalid");
     this.commitVerifiedIndex(seq, est.candidateRoc, est.advancesLastSeq);
     return est.index;
   }
@@ -2971,37 +2978,50 @@ var SrtpContext = class {
     const tagStart = srtpPacket.length - 10;
     const encPacket = srtpPacket.subarray(0, tagStart);
     const receivedTag = srtpPacket.subarray(tagStart);
+    const headerLen = this.rtpHeaderLength(encPacket);
     const ssrc = encPacket.readUInt32BE(8);
     const seq = encPacket.readUInt16BE(2);
     const estimate = this.estimateIndex(seq);
+    if (estimate.candidateRoc < 0 || estimate.candidateRoc > 4294967295) throw new Error("SRTP packet index exhausted or invalid");
     const rocBuf = Buffer.alloc(4);
     rocBuf.writeUInt32BE(estimate.candidateRoc, 0);
     const hmac = createHmac("sha1", this.authKey);
     hmac.update(encPacket);
     hmac.update(rocBuf);
     const expectedTag = hmac.digest().subarray(0, 10);
-    if (!expectedTag.equals(receivedTag)) {
+    if (!timingSafeEqual(expectedTag, receivedTag)) {
       throw new Error("SRTP decrypt: authentication tag mismatch");
     }
-    if (!this.checkAndUpdateReplay(estimate.index)) {
-      throw new Error("SRTP decrypt: replayed packet dropped");
-    }
-    this.commitVerifiedIndex(seq, estimate.candidateRoc, estimate.advancesLastSeq);
-    const headerLen = this.rtpHeaderLength(encPacket);
     const header = encPacket.subarray(0, headerLen);
     const encPayload = encPacket.subarray(headerLen);
     const iv = computeIV(this.saltKey, ssrc, estimate.index);
     const decipher = createCipheriv("aes-128-ctr", this.encKey, iv);
     const decPayload = decipher.update(encPayload);
-    return Buffer.concat([header, decPayload]);
+    const plain = Buffer.concat([header, decPayload]);
+    this.validatePadding(plain, headerLen);
+    if (!this.checkAndUpdateReplay(estimate.index)) {
+      throw new Error("SRTP decrypt: replayed packet dropped");
+    }
+    this.commitVerifiedIndex(seq, estimate.candidateRoc, estimate.advancesLastSeq);
+    return plain;
+  }
+  validatePadding(pkt, headerLen) {
+    if ((pkt[0] & 32) !== 0) {
+      const padding = pkt[pkt.length - 1];
+      if (!padding || padding > pkt.length - headerLen) throw new Error("Malformed RTP padding");
+    }
   }
   rtpHeaderLength(pkt) {
+    if (pkt.length < 12 || pkt[0] >>> 6 !== 2) throw new Error("Malformed RTP header");
     const csrcCount = pkt[0] & 15;
     const hasExt = (pkt[0] & 16) !== 0;
     let len = 12 + csrcCount * 4;
-    if (hasExt && pkt.length >= len + 4) {
+    if (len > pkt.length) throw new Error("Malformed RTP CSRC");
+    if (hasExt) {
+      if (pkt.length < len + 4) throw new Error("Malformed RTP extension");
       len += 4 + pkt.readUInt16BE(len + 2) * 4;
     }
+    if (len > pkt.length) throw new Error("Malformed RTP extension length");
     return len;
   }
   /**
@@ -3017,7 +3037,7 @@ var SrtpContext = class {
     }
     const diff = index - this.replayMaxIndex;
     if (diff > 0n) {
-      this.replayWindow = diff >= 64n ? 1n : this.replayWindow << diff | 1n;
+      this.replayWindow = diff >= 64n ? 1n : (this.replayWindow << diff | 1n) & (1n << 64n) - 1n;
       this.replayMaxIndex = index;
       return true;
     }
@@ -3136,7 +3156,7 @@ var RtpHandlerImpl = class extends EventEmitter2 {
     }
   }
   onMessage(buf, rinfo) {
-    if (buf.length < 12) return;
+    if (this.disposed || !this.remoteIp || !this.remotePort || buf.length < 12) return;
     if (this.remoteIp && rinfo.address !== this.remoteIp) {
       this.log.trace({ drop: "ip_mismatch", src: rinfo.address, expected: this.remoteIp }, "RTP dropped: unauthorized source address");
       return;
@@ -3144,14 +3164,10 @@ var RtpHandlerImpl = class extends EventEmitter2 {
     if (this.remotePort > 0) {
       if (rinfo.port !== this.remotePort) {
         if (!this.symmetricLearned && this.remoteIp && rinfo.address === this.remoteIp) {
-          this.remotePort = rinfo.port;
-          this.symmetricLearned = true;
         } else {
           this.log.trace({ drop: "port_mismatch", srcPort: rinfo.port, expected: this.remotePort }, "RTP dropped: unauthorized source port");
           return;
         }
-      } else {
-        this.symmetricLearned = true;
       }
     }
     if (buf.length < 12) return;
@@ -3175,21 +3191,31 @@ var RtpHandlerImpl = class extends EventEmitter2 {
     }
     if (rtpBuf.length < headerLen) return;
     if (rtpBuf[0] >>> 6 !== 2) return;
+    let payloadEnd = rtpBuf.length;
+    if ((byte0 & 32) !== 0) {
+      const padding = rtpBuf[rtpBuf.length - 1];
+      if (!padding || padding > payloadEnd - headerLen) return;
+      payloadEnd -= padding;
+    }
+    const payload = rtpBuf.subarray(headerLen, payloadEnd);
+    const payloadType = rtpBuf[1] & 127;
+    if (payloadType !== this.audioPt && payloadType !== this.dtmfPt) return;
+    if (payloadType === this.audioPt && payload.length === 0) return;
+    if (payloadType === this.dtmfPt && (payload.length !== 4 || DTMF_DIGIT[payload[0]] === void 0 || (payload[1] & 64) !== 0)) return;
     const packetSsrc = rtpBuf.readUInt32BE(8);
-    if (this.inboundSsrc === null) {
-      this.inboundSsrc = packetSsrc;
-    } else if (packetSsrc !== this.inboundSsrc) {
+    if (this.inboundSsrc !== null && packetSsrc !== this.inboundSsrc) {
       this.log.trace({ drop: "ssrc_mismatch", ssrc: packetSsrc, expected: this.inboundSsrc }, "RTP dropped: SSRC changed mid-call");
       return;
     }
-    const payloadType = rtpBuf[1] & 127;
+    this.inboundSsrc = packetSsrc;
+    this.remotePort = rinfo.port;
+    this.symmetricLearned = true;
     if (!this.forwardingEnabled) return;
     if (payloadType === this.audioPt) {
-      this.emit("audio", rtpBuf.subarray(headerLen));
+      this.emit("audio", payload);
       return;
     }
     if (payloadType === this.dtmfPt) {
-      const payload = rtpBuf.subarray(headerLen);
       if (payload.length < 4) return;
       const isEnd = (payload[1] & 128) !== 0;
       if (isEnd) {
@@ -3219,6 +3245,8 @@ async function createRtpHandler(opts) {
     remoteSrtpKey,
     remoteSrtpSalt
   } = opts;
+  const materials = [localSrtpKey, localSrtpSalt, remoteSrtpKey, remoteSrtpSalt];
+  if (materials.some(Boolean) && !materials.every(Boolean)) throw new Error("Incomplete SRTP keys");
   let decCtx;
   let encCtx;
   if (localSrtpKey && localSrtpSalt && remoteSrtpKey && remoteSrtpSalt) {
@@ -3320,10 +3348,10 @@ function parseSdpOffer(sdpBody) {
   let remoteSrtpKey;
   let remoteSrtpSalt;
   if (isSrtp) {
-    for (const m of sdpBody.matchAll(/^a=crypto:\d+\s+AES_128_CM_HMAC_SHA1_80\s+inline:([^\s|]+)/gim)) {
+    for (const m of sdpBody.matchAll(/^a=crypto:\d+\s+AES_128_CM_HMAC_SHA1_80\s+inline:([A-Za-z0-9+/]+)\r?$/gim)) {
       try {
         const keyAndSalt = Buffer.from(m[1], "base64");
-        if (keyAndSalt.length >= 30) {
+        if (/^[A-Za-z0-9+/]{40}$/.test(m[1]) && keyAndSalt.length === 30) {
           remoteSrtpKey = keyAndSalt.subarray(0, 16);
           remoteSrtpSalt = keyAndSalt.subarray(16, 30);
           break;
@@ -3332,9 +3360,12 @@ function parseSdpOffer(sdpBody) {
       }
     }
   }
+  if (isSrtp && (!remoteSrtpKey || !remoteSrtpSalt)) return null;
   return { remoteIp, remotePort, dtmfPt, audioPts, isSrtp, remoteSrtpKey, remoteSrtpSalt };
 }
 function buildSdpAnswer(localIp, localRtpPort, offer, mode, srtpEnabled, localSrtpKey, localSrtpSalt) {
+  if (offer.isSrtp && (!srtpEnabled || offer.remoteSrtpKey?.length !== 16 || offer.remoteSrtpSalt?.length !== 14)) throw new Error("Cannot answer SAVP without SRTP");
+  if (localSrtpKey && localSrtpKey.length !== 16 || localSrtpSalt && localSrtpSalt.length !== 14) throw new Error("Invalid local SRTP keys");
   const { dtmfPt, audioPts } = offer;
   const preferredCodecs = [];
   if (mode === "best") {
@@ -3382,7 +3413,7 @@ import { WebSocket } from "ws";
 function createWsClient(url, params, log) {
   const { streamSid, callSid, from, to, sipCallId, mediaFormat, extraCustomParameters } = params;
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, { maxPayload: 1024 * 1024 });
     const timer = setTimeout(() => {
       ws.terminate();
       reject(new Error(`WS connect timeout after 2000ms to ${url}`));
@@ -3522,14 +3553,15 @@ function createWsClient(url, params, log) {
             } catch {
               return;
             }
+            if (!msg || typeof msg !== "object") return;
             switch (msg.event) {
               case "media":
-                if (msg.media?.payload !== void 0) {
+                if (typeof msg.media?.payload === "string") {
                   enqueueOutbound(Buffer.from(msg.media.payload, "base64"));
                 }
                 break;
               case "mark":
-                if (msg.mark?.name !== void 0) {
+                if (typeof msg.mark?.name === "string" && Buffer.byteLength(msg.mark.name) <= 256) {
                   log.debug({ event: "mark_received", name: msg.mark.name }, "mark event received");
                   outboundDrain.enqueueMark(msg.mark.name);
                 }
@@ -3558,6 +3590,7 @@ function createWsClient(url, params, log) {
             log.warn({ event: "ws_send_skipped", reason: "not_open" }, "WS not OPEN — dropping mark echo");
             return;
           }
+          if (typeof markName !== "string" || Buffer.byteLength(markName) > 256) return;
           log.debug({ event: "mark_echoed", name: markName }, "mark echo sent to WS backend");
           ws.send(
             JSON.stringify({
@@ -3582,89 +3615,79 @@ function makeDrain(sendPacket, onMarkReady) {
   let count = 0;
   const PACKET_MS = 20;
   const MAX_QUEUE_ITEMS = 5e3;
-  let droppedFrames = 0;
+  const MAX_QUEUE_BYTES = 8e5;
+  const MAX_MARK_BYTES = 256;
+  let queuedBytes = 0;
+  const size = (item) => Buffer.isBuffer(item) ? item.length : Buffer.byteLength(item.markName);
+  function shift() {
+    const item = queue.shift();
+    if (item !== void 0) queuedBytes -= size(item);
+    return item;
+  }
+  function reserve(bytes) {
+    if (bytes > MAX_QUEUE_BYTES) return false;
+    while (queue.length >= MAX_QUEUE_ITEMS || queuedBytes + bytes > MAX_QUEUE_BYTES) shift();
+    return true;
+  }
   function schedule() {
     const now = Date.now();
     const deadline = base + count * PACKET_MS;
-    const behind = now - deadline;
-    let delay;
-    if (behind > PACKET_MS) {
+    if (now - deadline > PACKET_MS) {
       base = now;
       count = 0;
-      delay = 0;
-    } else {
-      delay = Math.max(0, deadline - now);
     }
     timer = setTimeout(() => {
       timer = null;
-      const item = queue.shift();
+      const item = shift();
       if (item !== void 0) {
         if (Buffer.isBuffer(item)) {
           count++;
           sendPacket(item);
-          if (queue.length > 0) {
-            schedule();
-          }
         } else {
           onMarkReady(item.markName);
-          if (queue.length > 0) {
-            timer = setTimeout(() => {
-              timer = null;
-              const next = queue.shift();
-              if (next !== void 0) {
-                if (Buffer.isBuffer(next)) {
-                  count++;
-                  sendPacket(next);
-                  if (queue.length > 0) schedule();
-                } else {
-                  onMarkReady(next.markName);
-                  if (queue.length > 0) schedule();
-                }
-              }
-            }, 0);
-          }
         }
       }
-    }, delay);
+      if (queue.length > 0 && timer === null) schedule();
+    }, Math.max(0, base + count * PACKET_MS - now));
+  }
+  function start() {
+    if (timer === null) {
+      base = Date.now();
+      count = 0;
+      schedule();
+    }
   }
   return {
     enqueue(pkt) {
-      if (queue.length >= MAX_QUEUE_ITEMS) {
-        const idx = queue.findIndex((item) => Buffer.isBuffer(item));
-        if (idx >= 0) queue.splice(idx, 1);
-        droppedFrames++;
-        if (droppedFrames === 1 || droppedFrames % 500 === 0) {
-        }
-      }
-      queue.push(pkt);
-      if (timer === null) {
-        base = Date.now();
-        count = 0;
-        schedule();
-      }
+      if (pkt.length === 0 || !reserve(pkt.length)) return;
+      const copy = Buffer.allocUnsafeSlow(pkt.length);
+      pkt.copy(copy);
+      queue.push(copy);
+      queuedBytes += copy.length;
+      start();
     },
     enqueueMark(name) {
+      if (typeof name !== "string") return;
+      const bytes = Buffer.byteLength(name);
+      if (bytes > MAX_MARK_BYTES) return;
       if (queue.length === 0 && timer === null) {
         onMarkReady(name);
         return;
       }
+      if (!reserve(bytes)) return;
       queue.push({ markName: name });
-      if (timer === null) {
-        base = Date.now();
-        count = 0;
-        schedule();
-      }
+      queuedBytes += bytes;
+      start();
     },
     stop() {
-      for (const item of queue) {
-        if (!Buffer.isBuffer(item)) {
-          onMarkReady(item.markName);
-        }
-      }
-      queue.length = 0;
+      const pending = queue.splice(0);
+      queuedBytes = 0;
       if (timer !== null) {
         clearTimeout(timer);
         timer = null;
+      }
+      for (const item of pending) {
+        if (!Buffer.isBuffer(item)) onMarkReady(item.markName);
       }
     }
   };
@@ -4355,6 +4378,20 @@ function mapTerminalReason(reason) {
 // vendor/sip-bridge/src/bridge/callManager.ts
 var RECENTLY_TERMINATED_TTL_MS = 5 * 6e4;
 var RECENTLY_TERMINATED_SWEEP_MS = 3e4;
+function tagOf(header) {
+  return header.match(/;tag=([^;\s>]+)/i)?.[1] ?? "";
+}
+function branchOf(raw) {
+  return extractHeader(raw, "Via").match(/;branch=([^;\s]+)/i)?.[1] ?? "";
+}
+function parseCseq(raw, method) {
+  const match = extractHeader(raw, "CSeq").match(/^(\d+) ([A-Z]+)$/);
+  const seq = match ? Number(match[1]) : NaN;
+  return match?.[2] === method && Number.isSafeInteger(seq) && seq >= 0 && seq < 2147483648 ? seq : null;
+}
+function sameInviteTransaction(invite, request, cancel) {
+  return branchOf(invite) === branchOf(request) && extractHeader(invite, "Via").split(";")[0] === extractHeader(request, "Via").split(";")[0] && extractHeader(invite, "From") === extractHeader(request, "From") && extractHeader(invite, "To") === extractHeader(request, "To") && invite.split(" ")[1] === request.split(" ")[1] && parseCseq(invite, "INVITE") === parseCseq(request, cancel ? "CANCEL" : "INVITE") && (cancel || invite.split("\r\n\r\n").slice(1).join("\r\n\r\n") === request.split("\r\n\r\n").slice(1).join("\r\n\r\n"));
+}
 function extractHeader(raw, name) {
   const m = raw.match(new RegExp(`^${name}:\\s*(.+)$`, "im"));
   return m ? m[1].trim() : "";
@@ -4446,7 +4483,7 @@ var CallManager = class {
   /** CallSid → snapshot of recently-terminated calls (TTL-swept) */
   recentlyTerminated = /* @__PURE__ */ new Map();
   /** Call-IDs currently being set up (between first INVITE and 200 OK stored) — dedup retransmissions */
-  pendingInvites = /* @__PURE__ */ new Set();
+  pendingInvites = /* @__PURE__ */ new Map();
   /** Call-IDs for which CANCEL was received before 200 OK was sent */
   cancelledInvites = /* @__PURE__ */ new Set();
   config;
@@ -4535,9 +4572,10 @@ var CallManager = class {
           this.log.error({ err, event: "invite_unhandled_error" }, "Unhandled error in INVITE handler");
         });
       },
-      onAck: (raw, _rinfo) => {
+      onAck: (raw, rinfo) => {
         const callId = extractHeader(raw, "Call-ID");
         const session = this.sessions.get(callId);
+        if (!session || !this.matchesDialog(session, raw, rinfo, "ACK")) return;
         if (session?.okRetransmitTimer !== null && session?.okRetransmitTimer !== void 0) {
           clearTimeout(session.okRetransmitTimer);
           session.okRetransmitTimer = null;
@@ -4648,10 +4686,13 @@ var CallManager = class {
   }
   // ── Private: INVITE handler ─────────────────────────────────────────────────
   async handleInvite(raw, rinfo) {
+    if (!this.isTrustedPeer(rinfo)) return;
     const from = extractHeader(raw, "From");
     const toHeader = extractHeader(raw, "To");
     const sipCallId = extractHeader(raw, "Call-ID");
     const cseq = extractHeader(raw, "CSeq");
+    const seq = parseCseq(raw, "INVITE");
+    if (!sipCallId || !tagOf(from) || seq === null || !branchOf(raw).startsWith("z9hG4bK")) return;
     if (this.isShuttingDown) {
       const resp503 = buildResponse({
         status: 503,
@@ -4668,6 +4709,7 @@ var CallManager = class {
     if (this.pendingInvites.has(sipCallId)) return;
     const existing = this.sessions.get(sipCallId);
     if (existing) {
+      if (!this.matchesPeer(existing, rinfo) || !existing.inviteRaw || !sameInviteTransaction(existing.inviteRaw, raw, false)) return;
       const localIp = this.config.SDP_CONTACT_IP ?? getLocalIp();
       const ok200 = buildResponse({
         status: 200,
@@ -4686,50 +4728,36 @@ var CallManager = class {
       this.sipHandle.sendRaw(Buffer.from(ok200), rinfo.port, rinfo.address);
       return;
     }
-    this.pendingInvites.add(sipCallId);
-    const remoteTag = raw.match(/;tag=([^\s;>]+)/i)?.[1] ?? "";
-    const remoteUri = raw.match(/^From:[^<\r\n]*<([^>]+)>/im)?.[1] ?? "";
-    const remoteContact = raw.match(/Contact:\s*<([^>]+)>/i)?.[1] ?? `sip:${rinfo.address}:${rinfo.port}`;
-    const localUri = toHeader.match(/<([^>]+)>/)?.[1] ?? toHeader.replace(/;.*$/, "").trim();
-    this.log.debug(
-      {
-        event: "dialog_headers",
-        sipCallId,
-        toHeader,
-        contact: remoteContact,
-        recordRoutes: extractAllRecordRoutes(raw)
-      },
-      "inbound dialog headers"
-    );
-    const trustedPeers = (this.config.SIP_TRUSTED_PEERS ?? "").split(",").map((entry2) => entry2.trim()).filter((entry2) => entry2.length > 0);
-    const isTrustedPeer = rinfo.address === this.sipHandle.registrarIp || rinfo.address === "127.0.0.1" || rinfo.address === "::1" || trustedPeers.includes(rinfo.address);
-    if (!isTrustedPeer) {
-      this.log.warn(
-        {
-          event: "invite_rejected_untrusted_peer",
-          src: rinfo.address,
-          registrarIp: this.sipHandle.registrarIp
-        },
-        "INVITE rejected — source is not the registered SIP trunk proxy"
-      );
-      const resp403 = buildResponse({
-        status: 403,
-        reason: "Forbidden",
-        vias: extractAllVias(raw),
-        from,
-        to: toHeader,
-        callId: sipCallId,
-        cseq
-      });
-      this.sipHandle.sendRaw(Buffer.from(resp403), rinfo.port, rinfo.address);
-      return;
-    }
-    const pai = isTrustedPeer ? extractHeader(raw, "P-Asserted-Identity") : null;
-    const fromUri = pai ? pai.match(/<([^>]+)>/)?.[1] ?? pai.trim() : remoteUri;
-    const requestUri = raw.split("\r\n")[0].match(/INVITE\s+(\S+)\s+SIP/i)?.[1] ?? `sip:${this.config.SIP_USER}@${this.config.SIP_DOMAIN}`;
-    const toUri = requestUri;
+    if (this.pendingInvites.size >= 64) return;
+    const pending = { raw, address: rinfo.address, port: rinfo.port, expires: Date.now() + 3e4, timer: void 0 };
+    this.pendingInvites.set(sipCallId, pending);
+    pending.timer = setTimeout(() => {
+      if (this.pendingInvites.get(sipCallId) === pending) {
+        this.pendingInvites.delete(sipCallId);
+        this.cancelledInvites.delete(sipCallId);
+      }
+    }, 3e4);
+    pending.timer.unref?.();
     let allocatedRtp;
     try {
+      const remoteTag = tagOf(from);
+      const remoteUri = raw.match(/^From:[^<\r\n]*<([^>]+)>/im)?.[1] ?? "";
+      const remoteContact = raw.match(/Contact:\s*<([^>]+)>/i)?.[1] ?? `sip:${rinfo.address}:${rinfo.port}`;
+      const localUri = toHeader.match(/<([^>]+)>/)?.[1] ?? toHeader.replace(/;.*$/, "").trim();
+      this.log.debug(
+        {
+          event: "dialog_headers",
+          sipCallId,
+          toHeader,
+          contact: remoteContact,
+          recordRoutes: extractAllRecordRoutes(raw)
+        },
+        "inbound dialog headers"
+      );
+      const pai = extractHeader(raw, "P-Asserted-Identity");
+      const fromUri = pai ? pai.match(/<([^>]+)>/)?.[1] ?? pai.trim() : remoteUri;
+      const requestUri = raw.split("\r\n")[0].match(/INVITE\s+(\S+)\s+SIP/i)?.[1] ?? `sip:${this.config.SIP_USER}@${this.config.SIP_DOMAIN}`;
+      const toUri = requestUri;
       const vias = extractAllVias(raw);
       const recordRoutes = extractAllRecordRoutes(raw);
       const trying = buildResponse({
@@ -4745,7 +4773,7 @@ var CallManager = class {
       const sdpBody = raw.split("\r\n\r\n").slice(1).join("\r\n\r\n");
       const sdpOffer = parseSdpOffer(sdpBody);
       const supportedPts = /* @__PURE__ */ new Set([0, 8, 9]);
-      if (!sdpOffer || !sdpOffer.audioPts.some((pt) => supportedPts.has(pt))) {
+      if (!sdpOffer || !sdpOffer.audioPts.some((pt) => supportedPts.has(pt)) || sdpOffer.isSrtp && !this.config.SRTP_ENABLED || this.config.SRTP_REQUIRED && !sdpOffer.isSrtp) {
         const resp488 = buildResponse({
           status: 488,
           reason: "Not Acceptable Here",
@@ -4789,7 +4817,7 @@ var CallManager = class {
       allocatedRtp = rtp;
       rtp.setRemote(sdpOffer.remoteIp, sdpOffer.remotePort);
       rtp.sendAudio(encodeSilence());
-      if (this.cancelledInvites.has(sipCallId)) {
+      if (this.cancelledInvites.has(sipCallId) || this.pendingInvites.get(sipCallId) !== pending || Date.now() >= pending.expires || this.isShuttingDown) {
         rtp.dispose();
         return;
       }
@@ -4868,7 +4896,7 @@ var CallManager = class {
         rtp.dispose();
         return;
       }
-      if (this.cancelledInvites.has(sipCallId)) {
+      if (this.cancelledInvites.has(sipCallId) || this.pendingInvites.get(sipCallId) !== pending || Date.now() >= pending.expires || this.isShuttingDown) {
         ws.stop();
         rtp.dispose();
         return;
@@ -4912,6 +4940,9 @@ var CallManager = class {
         ws,
         localTag,
         remoteTag,
+        signalingPeer: { address: rinfo.address, port: rinfo.port },
+        inviteRaw: raw,
+        remoteCseq: seq,
         remoteUri,
         remoteTarget: remoteContact,
         recordRoutes,
@@ -5026,8 +5057,11 @@ var CallManager = class {
         session.rtp.sendAudio(encodeSilence());
       }, 20);
     } finally {
-      this.pendingInvites.delete(sipCallId);
-      this.cancelledInvites.delete(sipCallId);
+      clearTimeout(pending.timer);
+      if (this.pendingInvites.get(sipCallId) === pending) {
+        this.pendingInvites.delete(sipCallId);
+        this.cancelledInvites.delete(sipCallId);
+      }
       if (allocatedRtp && !this.sessions.has(sipCallId)) {
         try {
           allocatedRtp.dispose();
@@ -5036,8 +5070,23 @@ var CallManager = class {
       }
     }
   }
+  // IP filtering is defense in depth, not cryptographic signaling authentication.
+  isTrustedPeer(peer) {
+    return peer.address === this.sipHandle.registrarIp || (this.config.SIP_TRUSTED_PEERS ?? "").split(",").map((s) => s.trim()).includes(peer.address);
+  }
+  matchesPeer(session, peer) {
+    return this.isTrustedPeer(peer) && session.signalingPeer?.address === peer.address && session.signalingPeer?.port === peer.port;
+  }
+  matchesDialog(session, raw, peer, method) {
+    const seq = parseCseq(raw, method);
+    return this.matchesPeer(session, peer) && tagOf(extractHeader(raw, "From")) === session.remoteTag && tagOf(extractHeader(raw, "To")) === session.localTag && branchOf(raw).startsWith("z9hG4bK") && seq !== null && (method === "ACK" ? seq === parseCseq(session.inviteRaw ?? "", "INVITE") : seq > (session.remoteCseq ?? -1));
+  }
   // ── Private: CANCEL handler ─────────────────────────────────────────────────
   handleCancel(raw, rinfo) {
+    if (!this.isTrustedPeer(rinfo)) return;
+    const pending = this.pendingInvites.get(extractHeader(raw, "Call-ID"));
+    if (this.sessions.has(extractHeader(raw, "Call-ID"))) return;
+    if (!pending || pending.expires <= Date.now() || pending.address !== rinfo.address || pending.port !== rinfo.port || !sameInviteTransaction(pending.raw, raw, true)) return;
     const callId = extractHeader(raw, "Call-ID");
     const vias = extractAllVias(raw);
     const from = extractHeader(raw, "From");
@@ -5045,12 +5094,6 @@ var CallManager = class {
     const cseq = extractHeader(raw, "CSeq");
     const cancelOk = buildResponse({ status: 200, reason: "OK", vias, from, to, callId, cseq });
     this.sipHandle.sendRaw(Buffer.from(cancelOk), rinfo.port, rinfo.address);
-    const session = this.sessions.get(callId);
-    if (session) {
-      this.log.info({ event: "cancel_after_200", callId }, "CANCEL received after 200 OK — terminating session");
-      this.terminateSession(session, "remote_cancel", false);
-      return;
-    }
     if (this.pendingInvites.has(callId)) {
       this.cancelledInvites.add(callId);
       const resp487 = buildResponse({
@@ -5070,12 +5113,15 @@ var CallManager = class {
   }
   // ── Private: BYE handler ────────────────────────────────────────────────────
   handleBye(raw, rinfo) {
+    if (!this.isTrustedPeer(rinfo)) return;
     const callId = extractHeader(raw, "Call-ID");
     const session = this.sessions.get(callId);
     if (!session) {
       this.log.warn({ event: "bye_unknown_call", callId }, "BYE for unknown call-id — ignoring");
       return;
     }
+    if (!this.matchesDialog(session, raw, rinfo, "BYE")) return;
+    session.remoteCseq = parseCseq(raw, "BYE");
     const byeOk = buildResponse({
       status: 200,
       reason: "OK",
@@ -5334,7 +5380,7 @@ function buildRegister(p) {
   return lines.join("\r\n") + "\r\n";
 }
 function parseStatusLine(raw) {
-  const m = raw.split("\r\n")[0].match(/SIP\/2\.0 (\d+) (.*)/);
+  const m = raw.split("\r\n")[0].match(/^SIP\/2\.0 ([1-6]\d{2}) (.*)$/);
   return m ? { status: +m[1], reason: m[2] } : { status: 0, reason: "unparseable" };
 }
 function getHeader(raw, name) {
@@ -5356,7 +5402,7 @@ function applyOptionsResponse(consecutiveFailures, status, isError) {
 async function createSipUserAgent(config, log, callbacks, signal) {
   signal?.throwIfAborted();
   const registrar = config.SIP_REGISTRAR;
-  const registrarPort = 5060;
+  const registrarPort = config.SIP_REGISTRAR_PORT ?? 5060;
   const registrarIp = await resolveRegistrar(registrar, signal);
   signal?.throwIfAborted();
   const localIp = config.SDP_CONTACT_IP ?? getLocalIp2();
@@ -5366,14 +5412,42 @@ async function createSipUserAgent(config, log, callbacks, signal) {
   let cseq = 1;
   let refreshTimer = null;
   let consecutiveFailures = 0;
-  let pingTimer = null;
   let optionsTimer = null;
   let settled = false;
   let stopped = false;
   const socket = dgram2.createSocket("udp4");
+  const transactions = /* @__PURE__ */ new Map();
+  const maxAuthRetries = 2;
+  function retireTransaction(method) {
+    const transaction = transactions.get(method);
+    if (transaction) clearTimeout(transaction.timer);
+    transactions.delete(method);
+  }
+  function trackTransaction(method, seq, branch, authRetries = 0) {
+    retireTransaction(method);
+    const timeout = method === "OPTIONS" ? 5e3 : 32e3;
+    const transaction = {
+      seq: String(seq),
+      branch,
+      sentBy: `${localIp}:${localPort}`,
+      deadline: Date.now() + timeout,
+      authRetries,
+      timer: setTimeout(() => {
+        if (transactions.get(method) !== transaction) return;
+        retireTransaction(method);
+        if (method === "OPTIONS") handleOptionsResponse(0, new Error("OPTIONS timeout"));
+        else registrationFailed(new Error("REGISTER timeout"));
+      }, timeout)
+    };
+    transactions.set(method, transaction);
+  }
+  let registrationFailed = () => {
+  };
   const dialogs = /* @__PURE__ */ new Map();
-  function sendRegister(authHeader) {
+  function sendRegister(authHeader, authRetries = 0) {
+    if (stopped) return;
     const branch = `z9hG4bK${randomHex(6)}`;
+    const seq = cseq++;
     const msg = buildRegister({
       user: config.SIP_USER,
       domain: config.SIP_DOMAIN,
@@ -5382,11 +5456,12 @@ async function createSipUserAgent(config, log, callbacks, signal) {
       localPort,
       callId,
       fromTag,
-      seq: cseq++,
+      seq,
       expires: config.SIP_EXPIRES,
       branch,
       auth: authHeader
     });
+    trackTransaction("REGISTER", seq, branch, authRetries);
     const buf = Buffer.from(msg);
     socket.send(buf, registrarPort, registrarIp, (err) => {
       if (err) {
@@ -5434,7 +5509,7 @@ async function createSipUserAgent(config, log, callbacks, signal) {
       signal?.removeEventListener("abort", abort);
       if (refreshTimer) clearTimeout(refreshTimer);
       if (optionsTimer) clearInterval(optionsTimer);
-      if (pingTimer) clearTimeout(pingTimer);
+      for (const method of transactions.keys()) retireTransaction(method);
       dialogs.clear();
       socket.removeAllListeners("message");
       try {
@@ -5449,6 +5524,10 @@ async function createSipUserAgent(config, log, callbacks, signal) {
       cleanup();
       reject(error);
     }
+    registrationFailed = (error) => {
+      if (!settled) fail(error);
+      else log.error({ err: error, event: "sip_register_failed" }, error.message);
+    };
     function abort() {
       fail(signal?.reason instanceof Error ? signal.reason : new Error("SIP startup aborted"));
     }
@@ -5475,27 +5554,40 @@ async function createSipUserAgent(config, log, callbacks, signal) {
         return;
       }
       if (firstLine.startsWith("SIP/2.0")) {
-        const cseqVal = getHeader(raw, "CSeq") ?? "";
-        if (cseqVal.includes("OPTIONS")) {
-          if (pingTimer !== null) {
-            clearTimeout(pingTimer);
-            pingTimer = null;
-          }
-          const { status: status2 } = parseStatusLine(raw);
-          handleOptionsResponse(status2, null);
-          return;
-        }
-        if (!cseqVal.includes("REGISTER")) {
-          log.debug({ event: "stray_response", cseq: cseqVal }, "ignoring non-REGISTER response");
-          return;
-        }
+        if (rinfo.address !== registrarIp || rinfo.port !== registrarPort) return;
+        const headers = raw.split("\r\n\r\n", 1)[0];
+        const uniqueHeader = (name) => {
+          const values = [...headers.matchAll(new RegExp(`^${name}:[ 	]*([^\r
+]+)`, "gim"))];
+          return values.length === 1 ? values[0][1].trim() : null;
+        };
+        const cseqVal = uniqueHeader("CSeq");
+        const parsedCseq = cseqVal?.match(/^(\d+) (REGISTER|OPTIONS)$/);
+        if (!parsedCseq || uniqueHeader("Call-ID") !== callId) return;
+        const method = parsedCseq[2];
+        const transaction = transactions.get(method);
+        if (!transaction || parsedCseq[1] !== transaction.seq) return;
+        const via = getHeader(headers, "Via")?.split(",")[0];
+        const parsedVia = via?.match(/^SIP\/2\.0\/UDP ([^;\s]+)((?:;.*)?)$/);
+        const branches = parsedVia ? [...parsedVia[2].matchAll(/;branch=([^;\s,]+)/g)] : [];
+        if (!parsedVia || parsedVia[1] !== transaction.sentBy || branches.length !== 1 || branches[0][1] !== transaction.branch) return;
+        if (Date.now() >= transaction.deadline) return;
         const { status, reason } = parseStatusLine(raw);
-        if (status >= 100 && status < 200) return;
+        if (status < 200 || status > 699) return;
+        retireTransaction(method);
+        if (method === "OPTIONS") {
+          handleOptionsResponse(status, null);
+          return;
+        }
         if (status === 401 || status === 407) {
           const challengeHeader = getHeader(raw, status === 401 ? "WWW-Authenticate" : "Proxy-Authenticate");
           if (!challengeHeader) {
             log.error({ event: "auth_missing", status }, `Got ${status} without auth challenge header`);
-            fail(new Error(`SIP ${status} without challenge`));
+            registrationFailed(new Error(`SIP ${status} without challenge`));
+            return;
+          }
+          if (transaction.authRetries >= maxAuthRetries) {
+            registrationFailed(new Error("SIP REGISTER authentication retry limit exceeded"));
             return;
           }
           const params = parseAuthChallenge(challengeHeader);
@@ -5505,7 +5597,7 @@ async function createSipUserAgent(config, log, callbacks, signal) {
           const response = md5(`${ha1}:${params["nonce"]}:${ha2}`);
           const auth = `Digest username="${config.SIP_USER}", realm="${params["realm"]}", nonce="${params["nonce"]}", uri="${registrarUri}", response="${response}", algorithm=MD5`;
           log.debug({ event: "auth_challenge", status }, `Responding to ${status} auth challenge`);
-          sendRegister(auth);
+          sendRegister(auth, transaction.authRetries + 1);
         } else if (status === 200) {
           log.info({ event: "sip_registered", expires: config.SIP_EXPIRES }, "SIP 200 OK — registration confirmed");
           const refreshMs = Math.floor(config.SIP_EXPIRES * 0.9) * 1e3;
@@ -5517,16 +5609,16 @@ async function createSipUserAgent(config, log, callbacks, signal) {
           if (optionsTimer) clearInterval(optionsTimer);
           optionsTimer = setInterval(() => {
             const branch = `z9hG4bK${randomHex(6)}`;
-            const optBuf = Buffer.from(buildOptions(cseq++, branch));
+            if (transactions.has("OPTIONS")) return;
+            const seq = cseq++;
+            const optBuf = Buffer.from(buildOptions(seq, branch));
+            trackTransaction("OPTIONS", seq, branch);
             socket.send(optBuf, registrarPort, registrarIp, (err) => {
-              if (err) {
+              if (err && transactions.get("OPTIONS")?.branch === branch) {
+                retireTransaction("OPTIONS");
                 handleOptionsResponse(0, err);
               }
             });
-            pingTimer = setTimeout(() => {
-              pingTimer = null;
-              handleOptionsResponse(0, new Error("OPTIONS timeout"));
-            }, 5e3);
           }, config.SIP_OPTIONS_INTERVAL * 1e3);
           if (!settled) {
             settled = true;
@@ -5548,6 +5640,7 @@ async function createSipUserAgent(config, log, callbacks, signal) {
                 dialogs.delete(dialogCallId);
               },
               unregister() {
+                retireTransaction("REGISTER");
                 const branch = `z9hG4bK${randomHex(6)}`;
                 const sipUri = `sip:${config.SIP_USER}@${config.SIP_DOMAIN}`;
                 const registrarUri = `sip:${registrar}`;
@@ -5577,7 +5670,7 @@ async function createSipUserAgent(config, log, callbacks, signal) {
           }
         } else {
           log.error({ event: "sip_register_failed", status, reason }, `SIP registration rejected: ${status} ${reason}`);
-          fail(new Error(`SIP ${status} ${reason}`));
+          registrationFailed(new Error(`SIP ${status} ${reason}`));
         }
       } else if (firstLine.startsWith("INVITE ")) {
         callbacks?.onInvite?.(raw, rinfo);
@@ -5642,7 +5735,8 @@ function mapEmbeddedConfig(config, address) {
     SDP_CONTACT_IP: config.sip.publicIp,
     RTP_PORT_MIN: config.media.rtpPortMin,
     RTP_PORT_MAX: config.media.rtpPortMax,
-    SRTP_ENABLED: config.sip.srtp,
+    SRTP_ENABLED: config.sip.srtp || config.sip.srtpRequired,
+    SRTP_REQUIRED: config.sip.srtpRequired,
     AUDIO_MODE: config.audio.mode,
     WS_TARGET_URL: `ws://${host}:${address.port}${config.media.path}${config.media.authToken ? `?token=${encodeURIComponent(config.media.authToken)}` : ""}`,
     SIP_EXPIRES: 120,
@@ -5832,9 +5926,10 @@ var VoiceCall = class {
     if (config.inbound.pin?.enabled && config.inbound.pin?.code) {
       this.pinState = { digits: "", attempts: 0 };
       this.pinTimeout = setTimeout(() => {
-        if (this.stopped || this.pinAuthenticated) return;
+        if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
+        this.pinLocked = true;
         this.respond(config.inbound.pin.lockoutText, false);
-        setTimeout(() => this.session.end("pin-timeout"), 3e3);
+        this.pinHangup = setTimeout(() => this.session.end("pin-timeout"), 3e3);
       }, config.inbound.pin.timeoutMs);
       if (config.inbound.pin.promptText) this.respond(config.inbound.pin.promptText, false);
     } else {
@@ -5861,10 +5956,12 @@ var VoiceCall = class {
   emittedEnd = -1;
   pinState = null;
   pinAuthenticated = false;
+  pinLocked = false;
+  pinHangup;
   pinTimeout;
   /** Caller keypad input; drives the DTMF-PIN gate until authenticated. */
   dtmf(digit) {
-    if (this.stopped || this.pinAuthenticated) return;
+    if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
     const pin = this.config.inbound.pin;
     if (!pin?.enabled || !pin.code) return;
     if (digit === "#") {
@@ -5880,9 +5977,11 @@ var VoiceCall = class {
       const attempts = (this.pinState?.attempts ?? 0) + 1;
       if (attempts >= pin.maxAttempts) {
         clearTimeout(this.pinTimeout);
+        this.pinState = { digits: "", attempts };
+        this.pinLocked = true;
         this.log?.("pin-lockout", { attempts });
         this.respond(pin.lockoutText, false);
-        setTimeout(() => this.session.end("pin-failed"), 3e3);
+        this.pinHangup = setTimeout(() => this.session.end("pin-failed"), 3e3);
         return;
       }
       this.pinState = { digits: "", attempts };
@@ -5902,7 +6001,7 @@ var VoiceCall = class {
   }
   audio(audio) {
     if (this.stopped) return;
-    if (!this.pinAuthenticated) return;
+    if (this.pinLocked || !this.pinAuthenticated) return;
     const input = this.session.media.codec === "pcmu" ? audio : this.session.media.decode(audio);
     if (this.socket.readyState === WebSocket2.OPEN) {
       this.send(input);
@@ -5916,7 +6015,7 @@ var VoiceCall = class {
     this.pendingBytes += input.length;
   }
   send(audio) {
-    if (this.stopped) return;
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (this.socket.bufferedAmount + audio.length > this.config.stt.maxBufferedBytes) {
       this.fail("stt-buffer-overflow");
       return;
@@ -5926,6 +6025,7 @@ var VoiceCall = class {
     });
   }
   result(event) {
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (event.type === "Error") {
       this.fail("stt-error-event");
       return;
@@ -5981,6 +6081,7 @@ var VoiceCall = class {
     this.session.interrupt();
   }
   respond(text2, agent) {
+    if (this.stopped || agent && (this.pinLocked || !this.pinAuthenticated)) return;
     this.interrupt();
     const generation = this.generation;
     const controller = new AbortController();
@@ -6029,6 +6130,7 @@ var VoiceCall = class {
     if (this.stopped) return;
     this.stopped = true;
     if (this.pinTimeout) clearTimeout(this.pinTimeout);
+    if (this.pinHangup) clearTimeout(this.pinHangup);
     this.interrupt();
     clearTimeout(this.connectTimer);
     if (this.keepalive) clearInterval(this.keepalive);
@@ -6192,9 +6294,10 @@ var DeepgramAgentCall = class {
     if (pin.enabled && pin.code) {
       this.pinState = { digits: "", attempts: 0 };
       this.pinTimeout = setTimeout(() => {
-        if (this.stopped || this.pinAuthenticated) return;
+        if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
+        this.pinLocked = true;
         this.speak(pin.lockoutText);
-        setTimeout(() => this.session.end("pin-timeout"), 3e3);
+        this.pinHangup = setTimeout(() => this.session.end("pin-timeout"), 3e3);
       }, pin.timeoutMs);
       if (pin.promptText) this.speak(pin.promptText);
     } else {
@@ -6218,11 +6321,13 @@ var DeepgramAgentCall = class {
   tasks = new AbortController();
   // DTMF PIN gate (same semantics as VoiceCall)
   pinAuthenticated = false;
+  pinLocked = false;
+  pinHangup;
   pinState = null;
   pinTimeout;
   /** Caller keypad input; drives the DTMF PIN gate until authenticated. */
   dtmf(digit) {
-    if (this.stopped || this.pinAuthenticated) return;
+    if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
     const pin = this.config.inbound.pin;
     if (!pin.enabled || !pin.code) return;
     if (digit === "#") {
@@ -6236,9 +6341,11 @@ var DeepgramAgentCall = class {
       const attempts = (this.pinState?.attempts ?? 0) + 1;
       if (attempts >= pin.maxAttempts) {
         clearTimeout(this.pinTimeout);
+        this.pinState = { digits: "", attempts };
+        this.pinLocked = true;
         this.log?.("pin-lockout", { attempts });
         this.speak(pin.lockoutText);
-        setTimeout(() => this.session.end("pin-failed"), 3e3);
+        this.pinHangup = setTimeout(() => this.session.end("pin-failed"), 3e3);
         return;
       }
       this.pinState = { digits: "", attempts };
@@ -6277,7 +6384,7 @@ var DeepgramAgentCall = class {
   }
   audio(audio) {
     if (this.stopped) return;
-    if (!this.pinAuthenticated) return;
+    if (this.pinLocked || !this.pinAuthenticated) return;
     const input = this.session.media.codec === "pcmu" ? audio : this.session.media.decode(audio);
     if (this.ready && this.socket.readyState === WebSocket3.OPEN) {
       this.send(input);
@@ -6291,7 +6398,7 @@ var DeepgramAgentCall = class {
     this.pendingBytes += input.length;
   }
   send(audio) {
-    if (this.stopped) return;
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (this.socket.bufferedAmount + audio.length > this.config.voice.maxInboundBytes) {
       this.fail("agent-buffer-overflow");
       return;
@@ -6301,9 +6408,9 @@ var DeepgramAgentCall = class {
     });
   }
   message(data, isBinary) {
-    if (this.stopped) return;
+    if (this.stopped || this.pinLocked) return;
     if (isBinary) {
-      if (!this.playing) return;
+      if (!this.pinAuthenticated || !this.playing) return;
       try {
         this.play(Buffer.from(data));
       } catch {
@@ -6380,6 +6487,7 @@ var DeepgramAgentCall = class {
     }
   }
   async callFunction(call) {
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (call.client_side === false) return;
     let content;
     const started = Date.now();
@@ -6393,7 +6501,7 @@ var DeepgramAgentCall = class {
       content = "The task could not be completed.";
       this.log?.("agent-function-error", { name: call.name, message: error instanceof Error ? error.message : String(error) });
     }
-    if (this.stopped || this.socket.readyState !== WebSocket3.OPEN) return;
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated || this.socket.readyState !== WebSocket3.OPEN) return;
     this.socket.send(JSON.stringify({ type: "FunctionCallResponse", id: call.id, name: call.name, content }));
   }
   play(chunk) {
@@ -6418,6 +6526,7 @@ var DeepgramAgentCall = class {
     this.stopped = true;
     this.tasks.abort();
     if (this.pinTimeout) clearTimeout(this.pinTimeout);
+    if (this.pinHangup) clearTimeout(this.pinHangup);
     clearTimeout(this.connectTimer);
     if (this.keepalive) clearInterval(this.keepalive);
     this.pending = [];

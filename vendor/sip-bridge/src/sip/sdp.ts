@@ -119,10 +119,10 @@ export function parseSdpOffer(sdpBody: string): SdpOffer | null {
   let remoteSrtpKey: Buffer | undefined;
   let remoteSrtpSalt: Buffer | undefined;
   if (isSrtp) {
-    for (const m of sdpBody.matchAll(/^a=crypto:\d+\s+AES_128_CM_HMAC_SHA1_80\s+inline:([^\s|]+)/gim)) {
+    for (const m of sdpBody.matchAll(/^a=crypto:\d+\s+AES_128_CM_HMAC_SHA1_80\s+inline:([A-Za-z0-9+/]+)\r?$/gim)) {
       try {
         const keyAndSalt = Buffer.from(m[1], 'base64');
-        if (keyAndSalt.length >= 30) {
+        if (/^[A-Za-z0-9+/]{40}$/.test(m[1]) && keyAndSalt.length === 30) {
           remoteSrtpKey = keyAndSalt.subarray(0, 16);
           remoteSrtpSalt = keyAndSalt.subarray(16, 30);
           break;
@@ -133,6 +133,7 @@ export function parseSdpOffer(sdpBody: string): SdpOffer | null {
     }
   }
 
+  if (isSrtp && (!remoteSrtpKey || !remoteSrtpSalt)) return null;
   return { remoteIp, remotePort, dtmfPt, audioPts, isSrtp, remoteSrtpKey, remoteSrtpSalt };
 }
 
@@ -158,6 +159,8 @@ export function buildSdpAnswer(
   localSrtpKey?: Buffer,
   localSrtpSalt?: Buffer,
 ): SdpAnswer {
+  if (offer.isSrtp && (!srtpEnabled || offer.remoteSrtpKey?.length !== 16 || offer.remoteSrtpSalt?.length !== 14)) throw new Error('Cannot answer SAVP without SRTP');
+  if ((localSrtpKey && localSrtpKey.length !== 16) || (localSrtpSalt && localSrtpSalt.length !== 14)) throw new Error('Invalid local SRTP keys');
   const { dtmfPt, audioPts } = offer;
 
   // Determine which audio codecs to advertise, in preference order.
@@ -275,6 +278,7 @@ export function buildSdpOffer(localIp: string, localRtpPort: number): string {
  */
 export function acceptSdpAnswer(answerSdp: string): SdpAnswerInfo {
   const parsed = parseSdpOffer(answerSdp);
+  if (parsed?.isSrtp) throw new Error('Outbound leg does not support SRTP');
   if (!parsed) {
     throw new Error('SDP answer malformed: missing c=IN IP4 or m=audio line');
   }

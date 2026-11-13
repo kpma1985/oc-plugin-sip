@@ -10,7 +10,7 @@
  * One SrtpContext instance handles one direction (encrypt XOR decrypt).
  */
 
-import { createCipheriv, createHmac } from 'node:crypto';
+import { createCipheriv, createHmac, timingSafeEqual } from 'node:crypto';
 
 // AES-128-CM key derivation labels (RFC 3711 §4.3.1)
 const LABEL_ENC  = 0x00; // session encryption key
@@ -21,8 +21,8 @@ const LABEL_SALT = 0x02; // session salt
  * Derive a session key using the SRTP pseudo-random function (RFC 3711 §4.3.1).
  *
  * The PRF for AES-128 is AES-128-CTR applied to an all-zeros plaintext with
- * IV = (master_salt_padded XOR (label * 2^16)), where master_salt is left-padded
- * with two 0x00 bytes to reach 16 bytes and label * 2^16 affects byte 13 (0-indexed).
+ * With kdr=0, x = master_salt XOR (label << 48), then x is
+ * right-padded by two zero bytes (multiplied by 2^16) for AES-CM.
  *
  * @param masterKey  16-byte AES-128 master key
  * @param masterSalt 14-byte master salt
@@ -30,14 +30,9 @@ const LABEL_SALT = 0x02; // session salt
  * @param length     desired output length in bytes
  */
 function deriveKey(masterKey: Buffer, masterSalt: Buffer, label: number, length: number): Buffer {
-  // Left-pad 14-byte salt with 2 zero bytes → 16-byte IV base
   const iv = Buffer.alloc(16, 0);
-  masterSalt.copy(iv, 2); // iv[2..15] = masterSalt[0..13]
-
-  // XOR label * 2^16 into the IV.
-  // For labels 0,1,2: label * 65536 = label at byte[13] (big-endian 128-bit)
-  iv[13] ^= label & 0xff;
-  // For labels > 255, byte[12] would also be affected, but we only use 0,1,2.
+  masterSalt.copy(iv); // salt * 2^16, not left padding
+  iv[7] ^= label;
 
   // AES-128-CTR with IV and counter=0 generates the pseudo-random key material.
   const blocks = Math.ceil(length / 16);
@@ -55,7 +50,7 @@ function deriveKey(masterKey: Buffer, masterSalt: Buffer, label: number, length:
 function computeIV(sessionSalt: Buffer, ssrc: number, packetIndex: bigint): Buffer {
   // Pad 14-byte session salt to 16 bytes (k_s * 2^16 in 128-bit big-endian)
   const iv = Buffer.alloc(16, 0);
-  sessionSalt.copy(iv, 2); // iv[2..15] = sessionSalt[0..13]
+  sessionSalt.copy(iv); // salt occupies bytes 0..13, low 16 bits are zero
 
   // XOR SSRC at bytes 4..7 (SSRC * 2^64 shifted to bits 95..64)
   iv[4] ^= (ssrc >>> 24) & 0xff;
@@ -63,15 +58,10 @@ function computeIV(sessionSalt: Buffer, ssrc: number, packetIndex: bigint): Buff
   iv[6] ^= (ssrc >>> 8)  & 0xff;
   iv[7] ^= ssrc          & 0xff;
 
-  // XOR packet index (48 bits) at bytes 10..15 (i * 2^16 shifted to bits 63..16)
-  const hi = Number(packetIndex >> 32n) & 0xffff; // top 16 bits of 48-bit index
-  const lo = Number(packetIndex & 0xffffffffn);    // bottom 32 bits
-  iv[10] ^= (hi >> 8)  & 0xff;
-  iv[11] ^= hi         & 0xff;
-  iv[12] ^= (lo >>> 24) & 0xff;
-  iv[13] ^= (lo >>> 16) & 0xff;
-  iv[14] ^= (lo >>> 8)  & 0xff;
-  iv[15] ^= lo          & 0xff;
+  // i * 2^16 occupies bytes 8..13, leaving the block counter at 14..15.
+  for (let byte = 0; byte < 6; byte++) {
+    iv[13 - byte] ^= Number((packetIndex >> BigInt(byte * 8)) & 0xffn);
+  }
 
   return iv;
 }
@@ -100,6 +90,7 @@ export class SrtpContext {
    * @param masterSalt 14-byte master salt (from the a=crypto: inline value)
    */
   constructor(masterKey: Buffer, masterSalt: Buffer) {
+    if (masterKey.length !== 16 || masterSalt.length !== 14) throw new Error('Invalid SRTP key length');
     this.encKey  = deriveKey(masterKey, masterSalt, LABEL_ENC,  16);
     this.authKey = deriveKey(masterKey, masterSalt, LABEL_AUTH, 20);
     this.saltKey = deriveKey(masterKey, masterSalt, LABEL_SALT, 14);
@@ -116,9 +107,10 @@ export class SrtpContext {
 
     const ssrc = rtpPacket.readUInt32BE(8);
     const seq  = rtpPacket.readUInt16BE(2);
+    const headerLen = this.rtpHeaderLength(rtpPacket);
+    this.validatePadding(rtpPacket, headerLen);
     const packetIndex = this.getOutboundPacketIndex(seq);
 
-    const headerLen = this.rtpHeaderLength(rtpPacket);
     const header  = rtpPacket.subarray(0, headerLen);
     const payload = rtpPacket.subarray(headerLen);
 
@@ -131,7 +123,7 @@ export class SrtpContext {
 
     // HMAC-SHA1-80: authenticate (header + encrypted_payload + ROC)
     const rocBuf = Buffer.alloc(4);
-    rocBuf.writeUInt32BE(this.roc, 0);
+    rocBuf.writeUInt32BE(Number(packetIndex >> 16n), 0);
     const hmac = createHmac('sha1', this.authKey);
     hmac.update(encPacket);
     hmac.update(rocBuf);
@@ -163,11 +155,11 @@ export class SrtpContext {
     }
     if (diff > SEQ_WRAP_THRESHOLD) {
       // Late / reordered packet from before the previous wrap: candidate ROC - 1
-      const candRoc = Math.max(0, this.roc - 1);
+      const candRoc = this.roc - 1;
       return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: false };
     }
     // Normal sequential packet
-    return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: true };
+    return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: seq > this.lastSeq };
   }
 
   /**
@@ -187,6 +179,7 @@ export class SrtpContext {
    */
   private getOutboundPacketIndex(seq: number): bigint {
     const est = this.estimateIndex(seq);
+    if (est.candidateRoc < 0 || est.candidateRoc > 0xffffffff) throw new Error('SRTP packet index exhausted or invalid');
     this.commitVerifiedIndex(seq, est.candidateRoc, est.advancesLastSeq);
     return est.index;
   }
@@ -209,6 +202,7 @@ export class SrtpContext {
     const encPacket = srtpPacket.subarray(0, tagStart);
     const receivedTag = srtpPacket.subarray(tagStart);
 
+    const headerLen = this.rtpHeaderLength(encPacket);
     const ssrc = encPacket.readUInt32BE(8);
     const seq  = encPacket.readUInt16BE(2);
 
@@ -216,25 +210,17 @@ export class SrtpContext {
     const estimate = this.estimateIndex(seq);
 
     // 2. Verify HMAC-SHA1-80 against the candidate ROC
+    if (estimate.candidateRoc < 0 || estimate.candidateRoc > 0xffffffff) throw new Error('SRTP packet index exhausted or invalid');
     const rocBuf = Buffer.alloc(4);
     rocBuf.writeUInt32BE(estimate.candidateRoc, 0);
     const hmac = createHmac('sha1', this.authKey);
     hmac.update(encPacket);
     hmac.update(rocBuf);
     const expectedTag = hmac.digest().subarray(0, 10);
-    if (!expectedTag.equals(receivedTag)) {
+    if (!timingSafeEqual(expectedTag, receivedTag)) {
       throw new Error('SRTP decrypt: authentication tag mismatch');
     }
 
-    // 3. RFC 3711 §3.3.2 anti-replay (64-packet sliding window)
-    if (!this.checkAndUpdateReplay(estimate.index)) {
-      throw new Error('SRTP decrypt: replayed packet dropped');
-    }
-
-    // 4. Commit receiver state only after authentication + replay acceptance
-    this.commitVerifiedIndex(seq, estimate.candidateRoc, estimate.advancesLastSeq);
-
-    const headerLen = this.rtpHeaderLength(encPacket);
     const header    = encPacket.subarray(0, headerLen);
     const encPayload = encPacket.subarray(headerLen);
 
@@ -243,15 +229,33 @@ export class SrtpContext {
     const decipher = createCipheriv('aes-128-ctr', this.encKey, iv);
     const decPayload = decipher.update(encPayload);
 
-    return Buffer.concat([header, decPayload]);
+    const plain = Buffer.concat([header, decPayload]);
+    this.validatePadding(plain, headerLen);
+    // No receiver state changes until authentication AND plaintext structure pass.
+    if (!this.checkAndUpdateReplay(estimate.index)) {
+      throw new Error('SRTP decrypt: replayed packet dropped');
+    }
+    this.commitVerifiedIndex(seq, estimate.candidateRoc, estimate.advancesLastSeq);
+    return plain;
   }
+  private validatePadding(pkt: Buffer, headerLen: number): void {
+    if ((pkt[0] & 0x20) !== 0) {
+      const padding = pkt[pkt.length - 1];
+      if (!padding || padding > pkt.length - headerLen) throw new Error('Malformed RTP padding');
+    }
+  }
+
   private rtpHeaderLength(pkt: Buffer): number {
+    if (pkt.length < 12 || pkt[0] >>> 6 !== 2) throw new Error('Malformed RTP header');
     const csrcCount = pkt[0] & 0x0f;
     const hasExt    = (pkt[0] & 0x10) !== 0;
     let len = 12 + csrcCount * 4;
-    if (hasExt && pkt.length >= len + 4) {
+    if (len > pkt.length) throw new Error('Malformed RTP CSRC');
+    if (hasExt) {
+      if (pkt.length < len + 4) throw new Error('Malformed RTP extension');
       len += 4 + pkt.readUInt16BE(len + 2) * 4;
     }
+    if (len > pkt.length) throw new Error('Malformed RTP extension length');
     return len;
   }
 
@@ -270,7 +274,7 @@ export class SrtpContext {
     const diff = index - this.replayMaxIndex;
     if (diff > 0n) {
       // Packet is newer than the current max index: advance the window.
-      this.replayWindow = diff >= 64n ? 1n : (this.replayWindow << diff) | 1n;
+      this.replayWindow = diff >= 64n ? 1n : ((this.replayWindow << diff) | 1n) & ((1n << 64n) - 1n);
       this.replayMaxIndex = index;
       return true;
     }

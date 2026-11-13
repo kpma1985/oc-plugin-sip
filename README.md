@@ -122,3 +122,38 @@ Custom requires confirmed mono PCM16-LE at 24000 Hz.
 ## Source
 
 <https://github.com/kpma1985/oc-plugin-sip>
+
+### Signaling and media security limits
+
+The embedded UDP SIP listener filters peers to the resolved registrar IP (or
+explicit vendor `SIP_TRUSTED_PEERS`); loopback is not implicitly trusted. Responses
+are bound to the registrar endpoint and an outstanding transaction. Inbound
+retransmissions, ACK/BYE and CANCEL are additionally matched to their original
+peer, dialog tags and transaction/CSeq as applicable. **IP filtering and SIP
+identifiers are not cryptographic authentication**: a network attacker able to
+spoof or observe UDP traffic remains a threat. Restrict listener access to your
+carrier or use a protected signaling network. Native SIP TLS is not implemented.
+SDES keys travel in signaling; SRTP alone does not protect those keys.
+
+Media encryption policies:
+- `sip.srtp: false` (default): plain RTP only; SAVP offers are rejected.
+- `sip.srtp: true`: opportunistic SRTP; valid SAVP offers use installed crypto
+  contexts, but AVP offers still use plaintext.
+- `sip.srtpRequired: true`: require valid SAVP/SDES on inbound calls, regardless of
+  the legacy `srtp` toggle; plain RTP is rejected. Only AES_128_CM_HMAC_SHA1_80 with
+  an exact 30-byte key/salt and no lifetime, MKI or session parameters is supported.
+
+The outbound B2BUA leg remains RTP-only and rejects SAVP answers; inbound required
+mode is **not** an end-to-end encrypted forwarding guarantee. SRTP now uses the
+RFC 3711 KDF/IV layout (checked against Appendix B vectors), which corrects the
+previous non-interoperable layout. Live-carrier interoperability is not covered
+by the automated local tests. Plain RTP source locking remains a source filter,
+not media authentication; SRTP authenticates packets before learning their port.
+
+Pending inbound setup has a 64-entry cap and a 30-second transaction lifetime.
+Expired setup cannot establish a call when asynchronous allocation completes.
+WebSocket media drains retain at most 5,000 items and 800,000 bytes; marks count
+against both bounds and names are limited to 256 UTF-8 bytes. On overload, oldest
+items (including marks) are discarded rather than falsely acknowledged as played.
+WebSocket inbound messages are capped at 1 MiB. PIN timeout/attempt exhaustion is
+terminal immediately, including the announcement-before-hangup window.

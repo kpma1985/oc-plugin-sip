@@ -167,7 +167,7 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
   }
 
   private onMessage(buf: Buffer, rinfo: dgram.RemoteInfo): void {
-    if (buf.length < 12) return;
+    if (this.disposed || !this.remoteIp || !this.remotePort || buf.length < 12) return;
 
     // Finding 2: Validate incoming media against the negotiated source IP
     if (this.remoteIp && rinfo.address !== this.remoteIp) {
@@ -179,14 +179,11 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
     if (this.remotePort > 0) {
       if (rinfo.port !== this.remotePort) {
         if (!this.symmetricLearned && this.remoteIp && rinfo.address === this.remoteIp) {
-          this.remotePort = rinfo.port;
-          this.symmetricLearned = true;
+          // Defer learning until authentication and structural checks pass.
         } else {
           this.log.trace({ drop: 'port_mismatch', srcPort: rinfo.port, expected: this.remotePort }, 'RTP dropped: unauthorized source port');
           return;
         }
-      } else {
-        this.symmetricLearned = true;
       }
     }
     if (buf.length < 12) return; // too short for a valid RTP/SRTP header
@@ -219,28 +216,40 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
     // Validate RTP version 2 (RFC 3550 §5.1)
     if ((rtpBuf[0] >>> 6) !== 2) return;
 
-    // Validate and lock SSRC to prevent multi-source injection into established call
+    let payloadEnd = rtpBuf.length;
+    if ((byte0 & 0x20) !== 0) {
+      const padding = rtpBuf[rtpBuf.length - 1];
+      if (!padding || padding > payloadEnd - headerLen) return;
+      payloadEnd -= padding;
+    }
+    const payload = rtpBuf.subarray(headerLen, payloadEnd);
+    const payloadType = rtpBuf[1] & 0x7f;
+    if (payloadType !== this.audioPt && payloadType !== this.dtmfPt) return;
+    if (payloadType === this.audioPt && payload.length === 0) return;
+    if (payloadType === this.dtmfPt && (payload.length !== 4 ||
+        DTMF_DIGIT[payload[0]] === undefined || (payload[1] & 0x40) !== 0)) return;
+
+    // Commit source identity only for authenticated, structurally valid,
+    // negotiated payloads. Unknown PTs must not capture the SSRC/NAT lock.
     const packetSsrc = rtpBuf.readUInt32BE(8);
-    if (this.inboundSsrc === null) {
-      this.inboundSsrc = packetSsrc;
-    } else if (packetSsrc !== this.inboundSsrc) {
+    if (this.inboundSsrc !== null && packetSsrc !== this.inboundSsrc) {
       this.log.trace({ drop: 'ssrc_mismatch', ssrc: packetSsrc, expected: this.inboundSsrc }, 'RTP dropped: SSRC changed mid-call');
       return;
     }
-
-    const payloadType = rtpBuf[1] & 0x7f;
+    this.inboundSsrc = packetSsrc;
+    this.remotePort = rinfo.port;
+    this.symmetricLearned = true;
 
     if (!this.forwardingEnabled) return;
 
     if (payloadType === this.audioPt) {
       // Negotiated audio codec — forward payload to WS
-      this.emit('audio', rtpBuf.subarray(headerLen));
+      this.emit('audio', payload);
       return;
     }
 
     if (payloadType === this.dtmfPt) {
       // RFC 4733 telephone-event
-      const payload = rtpBuf.subarray(headerLen);
       if (payload.length < 4) return;
       const isEnd = (payload[1] & 0x80) !== 0;
       if (isEnd) {
@@ -290,6 +299,8 @@ export async function createRtpHandler(opts: {
   const { portMin, portMax, log, audioPt, dtmfPt, silenceByte,
           localSrtpKey, localSrtpSalt, remoteSrtpKey, remoteSrtpSalt } = opts;
 
+  const materials = [localSrtpKey, localSrtpSalt, remoteSrtpKey, remoteSrtpSalt];
+  if (materials.some(Boolean) && !materials.every(Boolean)) throw new Error('Incomplete SRTP keys');
   // Build SRTP contexts when all four key material buffers are present.
   let decCtx: SrtpContext | undefined;
   let encCtx: SrtpContext | undefined;

@@ -91,6 +91,9 @@ export interface CallSession {
   localTag: string;
   /** Caller's From-tag (from INVITE From: …;tag=xxx) */
   remoteTag: string;
+  signalingPeer?: { address: string; port: number };
+  inviteRaw?: string;
+  remoteCseq?: number;
   /** Caller's SIP URI from INVITE From header (without tag) */
   remoteUri: string;
   /** Our dialog-local URI = the INVITE To-header URI (From-URI of our BYE) */
@@ -163,6 +166,22 @@ export interface CallSession {
 
 // ── Internal SIP helpers ──────────────────────────────────────────────────────
 
+function tagOf(header: string): string { return header.match(/;tag=([^;\s>]+)/i)?.[1] ?? ''; }
+function branchOf(raw: string): string { return extractHeader(raw, 'Via').match(/;branch=([^;\s]+)/i)?.[1] ?? ''; }
+function parseCseq(raw: string, method: string): number | null {
+  const match = extractHeader(raw, 'CSeq').match(/^(\d+) ([A-Z]+)$/);
+  const seq = match ? Number(match[1]) : NaN;
+  return match?.[2] === method && Number.isSafeInteger(seq) && seq >= 0 && seq < 2147483648 ? seq : null;
+}
+function sameInviteTransaction(invite: string, request: string, cancel: boolean): boolean {
+  return branchOf(invite) === branchOf(request)
+    && extractHeader(invite, 'Via').split(';')[0] === extractHeader(request, 'Via').split(';')[0]
+    && extractHeader(invite, 'From') === extractHeader(request, 'From')
+    && extractHeader(invite, 'To') === extractHeader(request, 'To')
+    && invite.split(' ')[1] === request.split(' ')[1]
+    && parseCseq(invite, 'INVITE') === parseCseq(request, cancel ? 'CANCEL' : 'INVITE')
+    && (cancel || invite.split('\r\n\r\n').slice(1).join('\r\n\r\n') === request.split('\r\n\r\n').slice(1).join('\r\n\r\n'));
+}
 function extractHeader(raw: string, name: string): string {
   const m = raw.match(new RegExp(`^${name}:\\s*(.+)$`, 'im'));
   return m ? m[1].trim() : '';
@@ -318,7 +337,7 @@ export class CallManager {
   /** CallSid → snapshot of recently-terminated calls (TTL-swept) */
   private readonly recentlyTerminated = new Map<string, TerminatedCall>();
   /** Call-IDs currently being set up (between first INVITE and 200 OK stored) — dedup retransmissions */
-  private readonly pendingInvites = new Set<string>();
+  private readonly pendingInvites = new Map<string, { raw: string; address: string; port: number; expires: number; timer?: ReturnType<typeof setTimeout> }>();
   /** Call-IDs for which CANCEL was received before 200 OK was sent */
   private readonly cancelledInvites = new Set<string>();
   private readonly config: Config;
@@ -425,10 +444,11 @@ export class CallManager {
           this.log.error({ err, event: 'invite_unhandled_error' }, 'Unhandled error in INVITE handler');
         });
       },
-      onAck: (raw: string, _rinfo: RemoteInfo) => {
+      onAck: (raw: string, rinfo: RemoteInfo) => {
         // ACK received — stop 200 OK retransmission
         const callId = extractHeader(raw, 'Call-ID');
         const session = this.sessions.get(callId);
+        if (!session || !this.matchesDialog(session, raw, rinfo, 'ACK')) return;
         if (session?.okRetransmitTimer !== null && session?.okRetransmitTimer !== undefined) {
           clearTimeout(session.okRetransmitTimer);
           session.okRetransmitTimer = null;
@@ -554,12 +574,15 @@ export class CallManager {
   // ── Private: INVITE handler ─────────────────────────────────────────────────
 
   private async handleInvite(raw: string, rinfo: RemoteInfo): Promise<void> {
+    if (!this.isTrustedPeer(rinfo)) return;
     // 1. Extract required headers
     const from = extractHeader(raw, 'From');
     const toHeader = extractHeader(raw, 'To');
     const sipCallId = extractHeader(raw, 'Call-ID');
     const cseq = extractHeader(raw, 'CSeq');
 
+    const seq = parseCseq(raw, 'INVITE');
+    if (!sipCallId || !tagOf(from) || seq === null || !branchOf(raw).startsWith('z9hG4bK')) return;
     // Reject new INVITEs during graceful shutdown drain (LCY-01 / OBS-03 §21.5.4)
     if (this.isShuttingDown) {
       const resp503 = buildResponse({
@@ -574,6 +597,7 @@ export class CallManager {
     if (this.pendingInvites.has(sipCallId)) return;
     const existing = this.sessions.get(sipCallId);
     if (existing) {
+      if (!this.matchesPeer(existing, rinfo) || !existing.inviteRaw || !sameInviteTransaction(existing.inviteRaw, raw, false)) return;
       // Re-send 200 OK so sipgate stops retransmitting (reuse stored sdpAnswer — no re-negotiation)
       const localIp = this.config.SDP_CONTACT_IP ?? getLocalIp();
       const ok200 = buildResponse({
@@ -586,87 +610,56 @@ export class CallManager {
       this.sipHandle.sendRaw(Buffer.from(ok200), rinfo.port, rinfo.address);
       return;
     }
-    this.pendingInvites.add(sipCallId);
-
-    // remoteTag: caller's ;tag= from From header
-    const remoteTag = raw.match(/;tag=([^\s;>]+)/i)?.[1] ?? '';
-    // remoteUri: caller's SIP URI from From header (strip angle brackets)
-    // Skip optional display name (e.g. "Alice" <sip:...>) before the angle-bracket URI
-    const remoteUri = raw.match(/^From:[^<\r\n]*<([^>]+)>/im)?.[1] ?? '';
-    // remoteContact: Contact URI for BYE routing
-    const remoteContact =
-      raw.match(/Contact:\s*<([^>]+)>/i)?.[1] ??
-      `sip:${rinfo.address}:${rinfo.port}`;
-    // localUri: the To-header URI we were addressed as — this is the dialog's
-    // local URI and MUST be the From-URI of any in-dialog request we originate.
-    const localUri =
-      toHeader.match(/<([^>]+)>/)?.[1] ?? toHeader.replace(/;.*$/, '').trim();
-    // Dialog headers retained for the in-dialog BYE route set (RFC 3261 §12.2).
-    // Logged at debug only — carries phone numbers, never emitted at info.
-    this.log.debug(
-      {
-        event: 'dialog_headers',
-        sipCallId,
-        toHeader,
-        contact: remoteContact,
-        recordRoutes: extractAllRecordRoutes(raw),
-      },
-      'inbound dialog headers',
-    );
-
-    // ── Finding 1 (MCP07): authenticate the SIP peer before trusting identity ──
-    // The listener is bound to a public/local address, so a direct, unauthenticated
-    // UDP INVITE can otherwise claim any caller number via From or P-Asserted-Identity
-    // and walk straight past the channel's caller allowlist.
-    // Legitimate inbound calls must arrive from the resolved SIP registrar / carrier
-    // proxy (which authenticates the trunk), a loopback test harness, or an
-    // explicitly configured trusted peer.
-    const trustedPeers = (this.config.SIP_TRUSTED_PEERS ?? '')
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0);
-    const isTrustedPeer =
-      rinfo.address === this.sipHandle.registrarIp ||
-      rinfo.address === '127.0.0.1' ||
-      rinfo.address === '::1' ||
-      trustedPeers.includes(rinfo.address);
-
-    if (!isTrustedPeer) {
-      this.log.warn(
-        {
-          event: 'invite_rejected_untrusted_peer',
-          src: rinfo.address,
-          registrarIp: this.sipHandle.registrarIp,
-        },
-        'INVITE rejected — source is not the registered SIP trunk proxy',
-      );
-      const resp403 = buildResponse({
-        status: 403,
-        reason: 'Forbidden',
-        vias: extractAllVias(raw),
-        from,
-        to: toHeader,
-        callId: sipCallId,
-        cseq,
-      });
-      this.sipHandle.sendRaw(Buffer.from(resp403), rinfo.port, rinfo.address);
-      return;
-    }
-
-    // P-Asserted-Identity carries the real caller number when From is anonymous.
-    // Only honour it when the request came from the authenticated trunk peer.
-    const pai = isTrustedPeer ? extractHeader(raw, 'P-Asserted-Identity') : null;
-    const fromUri = pai
-      ? (pai.match(/<([^>]+)>/)?.[1] ?? pai.trim())
-      : remoteUri;
-
-    // Request-URI contains the actual dialed number (first line of INVITE)
-    const requestUri = raw.split('\r\n')[0].match(/INVITE\s+(\S+)\s+SIP/i)?.[1]
-      ?? `sip:${this.config.SIP_USER}@${this.config.SIP_DOMAIN}`;
-    const toUri = requestUri;
+    if (this.pendingInvites.size >= 64) return;
+    const pending = { raw, address: rinfo.address, port: rinfo.port, expires: Date.now() + 30_000, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    this.pendingInvites.set(sipCallId, pending);
+    pending.timer = setTimeout(() => {
+      if (this.pendingInvites.get(sipCallId) === pending) {
+        this.pendingInvites.delete(sipCallId);
+        this.cancelledInvites.delete(sipCallId);
+      }
+    }, 30_000);
+    pending.timer.unref?.();
     let allocatedRtp: RtpHandler | undefined;
-
     try {
+
+      // remoteTag: caller's ;tag= from From header
+      const remoteTag = tagOf(from);
+      // remoteUri: caller's SIP URI from From header (strip angle brackets)
+      // Skip optional display name (e.g. "Alice" <sip:...>) before the angle-bracket URI
+      const remoteUri = raw.match(/^From:[^<\r\n]*<([^>]+)>/im)?.[1] ?? '';
+      // remoteContact: Contact URI for BYE routing
+      const remoteContact =
+        raw.match(/Contact:\s*<([^>]+)>/i)?.[1] ??
+        `sip:${rinfo.address}:${rinfo.port}`;
+      // localUri: the To-header URI we were addressed as — this is the dialog's
+      // local URI and MUST be the From-URI of any in-dialog request we originate.
+      const localUri =
+        toHeader.match(/<([^>]+)>/)?.[1] ?? toHeader.replace(/;.*$/, '').trim();
+      // Dialog headers retained for the in-dialog BYE route set (RFC 3261 §12.2).
+      // Logged at debug only — carries phone numbers, never emitted at info.
+      this.log.debug(
+        {
+          event: 'dialog_headers',
+          sipCallId,
+          toHeader,
+          contact: remoteContact,
+          recordRoutes: extractAllRecordRoutes(raw),
+        },
+        'inbound dialog headers',
+      );
+
+      // P-Asserted-Identity carries the real caller number when From is anonymous.
+      // Honor only from the configured peer allowlist; UDP IP filtering is not authentication.
+      const pai = extractHeader(raw, 'P-Asserted-Identity');
+      const fromUri = pai
+        ? (pai.match(/<([^>]+)>/)?.[1] ?? pai.trim())
+        : remoteUri;
+
+      // Request-URI contains the actual dialed number (first line of INVITE)
+      const requestUri = raw.split('\r\n')[0].match(/INVITE\s+(\S+)\s+SIP/i)?.[1]
+        ?? `sip:${this.config.SIP_USER}@${this.config.SIP_DOMAIN}`;
+      const toUri = requestUri;
       // 2. Send 100 Trying immediately (no To-tag)
       const vias = extractAllVias(raw);
       const recordRoutes = extractAllRecordRoutes(raw);
@@ -685,7 +678,9 @@ export class CallManager {
       const sdpBody = raw.split('\r\n\r\n').slice(1).join('\r\n\r\n');
       const sdpOffer = parseSdpOffer(sdpBody);
       const supportedPts = new Set([0, 8, 9]);
-      if (!sdpOffer || !sdpOffer.audioPts.some((pt) => supportedPts.has(pt))) {
+      if (!sdpOffer || !sdpOffer.audioPts.some((pt) => supportedPts.has(pt)) ||
+          (sdpOffer.isSrtp && !this.config.SRTP_ENABLED) ||
+          (this.config.SRTP_REQUIRED && !sdpOffer.isSrtp)) {
         const resp488 = buildResponse({
           status: 488,
           reason: 'Not Acceptable Here',
@@ -746,7 +741,7 @@ export class CallManager {
       rtp.sendAudio(encodeSilence());
 
       // Check if CANCEL arrived while we were awaiting RTP allocation
-      if (this.cancelledInvites.has(sipCallId)) {
+      if (this.cancelledInvites.has(sipCallId) || this.pendingInvites.get(sipCallId) !== pending || Date.now() >= pending.expires || this.isShuttingDown) {
         rtp.dispose();
         return; // 487 already sent by handleCancel
       }
@@ -836,7 +831,7 @@ export class CallManager {
       }
 
       // Check if CANCEL arrived while we were awaiting WS connection
-      if (this.cancelledInvites.has(sipCallId)) {
+      if (this.cancelledInvites.has(sipCallId) || this.pendingInvites.get(sipCallId) !== pending || Date.now() >= pending.expires || this.isShuttingDown) {
         ws.stop();
         rtp.dispose();
         return; // 487 already sent by handleCancel
@@ -879,6 +874,9 @@ export class CallManager {
         ws,
         localTag,
         remoteTag,
+        signalingPeer: { address: rinfo.address, port: rinfo.port },
+        inviteRaw: raw,
+        remoteCseq: seq,
         remoteUri,
         remoteTarget: remoteContact,
         recordRoutes,
@@ -1023,8 +1021,11 @@ export class CallManager {
         session.rtp.sendAudio(encodeSilence());
       }, 20);
     } finally {
-      this.pendingInvites.delete(sipCallId);
-      this.cancelledInvites.delete(sipCallId);
+      clearTimeout(pending.timer);
+      if (this.pendingInvites.get(sipCallId) === pending) {
+        this.pendingInvites.delete(sipCallId);
+        this.cancelledInvites.delete(sipCallId);
+      }
       // Finding 3 (MCP05): Exception-safe cleanup of partially initialized calls.
       // If RTP sockets were allocated but the session was not committed into
       // this.sessions (e.g. cancelled during setup, voice URL failed, or WS rejected),
@@ -1035,9 +1036,25 @@ export class CallManager {
     }
   }
 
+  // IP filtering is defense in depth, not cryptographic signaling authentication.
+  private isTrustedPeer(peer: RemoteInfo): boolean {
+    return peer.address === this.sipHandle.registrarIp || (this.config.SIP_TRUSTED_PEERS ?? '').split(',').map(s => s.trim()).includes(peer.address);
+  }
+  private matchesPeer(session: CallSession, peer: RemoteInfo): boolean {
+    return this.isTrustedPeer(peer) && session.signalingPeer?.address === peer.address && session.signalingPeer?.port === peer.port;
+  }
+  private matchesDialog(session: CallSession, raw: string, peer: RemoteInfo, method: string): boolean {
+    const seq = parseCseq(raw, method);
+    return this.matchesPeer(session, peer) && tagOf(extractHeader(raw, 'From')) === session.remoteTag && tagOf(extractHeader(raw, 'To')) === session.localTag && branchOf(raw).startsWith('z9hG4bK') && seq !== null && (method === 'ACK' ? seq === parseCseq(session.inviteRaw ?? '', 'INVITE') : seq > (session.remoteCseq ?? -1));
+  }
+
   // ── Private: CANCEL handler ─────────────────────────────────────────────────
 
   private handleCancel(raw: string, rinfo: RemoteInfo): void {
+    if (!this.isTrustedPeer(rinfo)) return;
+    const pending = this.pendingInvites.get(extractHeader(raw, 'Call-ID'));
+    if (this.sessions.has(extractHeader(raw, 'Call-ID'))) return;
+    if (!pending || pending.expires <= Date.now() || pending.address !== rinfo.address || pending.port !== rinfo.port || !sameInviteTransaction(pending.raw, raw, true)) return;
     const callId = extractHeader(raw, 'Call-ID');
     const vias = extractAllVias(raw);
     const from = extractHeader(raw, 'From');
@@ -1047,15 +1064,6 @@ export class CallManager {
     // Always respond 200 OK to CANCEL (RFC 3261 §9.2)
     const cancelOk = buildResponse({ status: 200, reason: 'OK', vias, from, to, callId, cseq });
     this.sipHandle.sendRaw(Buffer.from(cancelOk), rinfo.port, rinfo.address);
-
-    const session = this.sessions.get(callId);
-    if (session) {
-      // 200 OK was sent but never reached the caller (otherwise they'd send BYE, not CANCEL).
-      // Terminate the session and let the WS backend know via the stop event.
-      this.log.info({ event: 'cancel_after_200', callId }, 'CANCEL received after 200 OK — terminating session');
-      this.terminateSession(session, 'remote_cancel', false);
-      return;
-    }
 
     if (this.pendingInvites.has(callId)) {
       // Still setting up — mark as cancelled so handleInvite sends 487 after its next await
@@ -1078,6 +1086,7 @@ export class CallManager {
   // ── Private: BYE handler ────────────────────────────────────────────────────
 
   private handleBye(raw: string, rinfo: RemoteInfo): void {
+    if (!this.isTrustedPeer(rinfo)) return;
     const callId = extractHeader(raw, 'Call-ID');
     const session = this.sessions.get(callId);
     if (!session) {
@@ -1085,6 +1094,8 @@ export class CallManager {
       return;
     }
 
+    if (!this.matchesDialog(session, raw, rinfo, 'BYE')) return;
+    session.remoteCseq = parseCseq(raw, 'BYE')!;
     // Send 200 OK to BYE (copy Via/From/To/Call-ID/CSeq from the BYE)
     const byeOk = buildResponse({
       status: 200,

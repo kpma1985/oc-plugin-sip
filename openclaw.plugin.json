@@ -217,6 +217,10 @@
               "srtp": {
                 "type": "boolean",
                 "default": false
+              },
+              "srtpRequired": {
+                "type": "boolean",
+                "default": false
               }
             }
           },
@@ -1418,6 +1422,10 @@
             "format": "ipv4"
           },
           "srtp": {
+            "type": "boolean",
+            "default": false
+          },
+          "srtpRequired": {
             "type": "boolean",
             "default": false
           }

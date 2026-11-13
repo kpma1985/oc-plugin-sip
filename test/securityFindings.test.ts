@@ -89,20 +89,18 @@ describe('Security Findings Remediation Tests', () => {
     expect(dec2.subarray(12)).toEqual(plain2.subarray(12));
   });
 
-  it('Finding 4: makeDrain bounds the audio queue and drops oldest frames on overflow', () => {
-    const sent: Buffer[] = [];
-    const drain = makeDrainForTest(
-      (pkt) => sent.push(pkt),
-      () => {},
-    );
-
-    // Enqueue 5050 items (exceeds MAX_QUEUE_ITEMS = 5000)
-    for (let i = 0; i < 5050; i++) {
-      drain.enqueue(Buffer.alloc(160, i & 0xff));
-    }
-
-    drain.stop();
-    // Proves that enqueueing beyond limit does not throw or crash and queue stays bounded
+  it('Finding 4: makeDrain drops oldest frames on item overflow, retaining exactly the newest 5000', () => {
+    vi.useFakeTimers();
+    try {
+      const sent: number[] = [];
+      const drain = makeDrainForTest((pkt) => sent.push(pkt.readUInt32BE()), () => {});
+      for (let i = 0; i < 5050; i++) {
+        const pkt = Buffer.alloc(160); pkt.writeUInt32BE(i); drain.enqueue(pkt);
+      }
+      vi.runAllTimers();
+      expect(sent).toEqual(Array.from({ length: 5000 }, (_, i) => i + 50));
+      drain.stop();
+    } finally { vi.useRealTimers(); }
   });
 
   it('Finding 2: RTP handler drops packets from unauthorized source IP', async () => {

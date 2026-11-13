@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import type { CallSession } from '../media/callSession.js';
 import type { SipPluginConfig } from '../config.js';
 import type { UtteranceHook } from './voiceCall.js';
-import { speakAnnouncement, type VoiceDependencies } from './voiceCall.js';
+import { speakAnnouncement } from './voiceCall.js';
 
 export type AgentLog = (event: string, fields?: Record<string, unknown>) => void;
 
@@ -94,6 +94,8 @@ export class DeepgramAgentCall implements VoiceEngine {
 
   // DTMF PIN gate (same semantics as VoiceCall)
   private pinAuthenticated = false;
+  private pinLocked = false;
+  private pinHangup?: NodeJS.Timeout;
   private pinState: { digits: string; attempts: number } | null = null;
   private pinTimeout: NodeJS.Timeout | undefined;
 
@@ -120,9 +122,10 @@ export class DeepgramAgentCall implements VoiceEngine {
     if (pin.enabled && pin.code) {
       this.pinState = { digits: '', attempts: 0 };
       this.pinTimeout = setTimeout(() => {
-        if (this.stopped || this.pinAuthenticated) return;
+        if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
+        this.pinLocked = true;
         this.speak(pin.lockoutText);
-        setTimeout(() => this.session.end('pin-timeout'), 3000);
+        this.pinHangup = setTimeout(() => this.session.end('pin-timeout'), 3000);
       }, pin.timeoutMs);
       if (pin.promptText) this.speak(pin.promptText);
     } else {
@@ -132,7 +135,7 @@ export class DeepgramAgentCall implements VoiceEngine {
 
   /** Caller keypad input; drives the DTMF PIN gate until authenticated. */
   dtmf(digit: string): void {
-    if (this.stopped || this.pinAuthenticated) return;
+    if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
     const pin = this.config.inbound.pin;
     if (!pin.enabled || !pin.code) return;
     if (digit === '#') {
@@ -146,9 +149,11 @@ export class DeepgramAgentCall implements VoiceEngine {
       const attempts = (this.pinState?.attempts ?? 0) + 1;
       if (attempts >= pin.maxAttempts) {
         clearTimeout(this.pinTimeout);
+        this.pinState = { digits: '', attempts };
+        this.pinLocked = true;
         this.log?.('pin-lockout', { attempts });
         this.speak(pin.lockoutText);
-        setTimeout(() => this.session.end('pin-failed'), 3000);
+        this.pinHangup = setTimeout(() => this.session.end('pin-failed'), 3000);
         return;
       }
       this.pinState = { digits: '', attempts };
@@ -184,7 +189,7 @@ export class DeepgramAgentCall implements VoiceEngine {
 
   audio(audio: Uint8Array): void {
     if (this.stopped) return;
-    if (!this.pinAuthenticated) return;
+    if (this.pinLocked || !this.pinAuthenticated) return;
     const input = this.session.media.codec === 'pcmu' ? audio : this.session.media.decode(audio);
     if (this.ready && this.socket.readyState === WebSocket.OPEN) { this.send(input); return; }
     if (this.pendingBytes + input.length > this.config.voice.maxInboundBytes) { this.fail('agent-pending-overflow'); return; }
@@ -192,15 +197,15 @@ export class DeepgramAgentCall implements VoiceEngine {
   }
 
   private send(audio: Uint8Array): void {
-    if (this.stopped) return;
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (this.socket.bufferedAmount + audio.length > this.config.voice.maxInboundBytes) { this.fail('agent-buffer-overflow'); return; }
     this.socket.send(audio, { binary: true }, error => { if (error) this.fail('agent-send-failed'); });
   }
 
   private message(data: WebSocket.RawData, isBinary: boolean): void {
-    if (this.stopped) return;
+    if (this.stopped || this.pinLocked) return;
     if (isBinary) {
-      if (!this.playing) return;
+      if (!this.pinAuthenticated || !this.playing) return;
       try { this.play(Buffer.from(data as Buffer)); } catch { this.fail('agent-playback-overflow'); }
       return;
     }
@@ -255,6 +260,7 @@ export class DeepgramAgentCall implements VoiceEngine {
   }
 
   private async callFunction(call: FunctionCall): Promise<void> {
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (call.client_side === false) return;
     let content: string;
     const started = Date.now();
@@ -268,7 +274,7 @@ export class DeepgramAgentCall implements VoiceEngine {
       content = 'The task could not be completed.';
       this.log?.('agent-function-error', { name: call.name, message: error instanceof Error ? error.message : String(error) });
     }
-    if (this.stopped || this.socket.readyState !== WebSocket.OPEN) return;
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated || this.socket.readyState !== WebSocket.OPEN) return;
     this.socket.send(JSON.stringify({ type: 'FunctionCallResponse', id: call.id, name: call.name, content }));
   }
 
@@ -291,6 +297,7 @@ export class DeepgramAgentCall implements VoiceEngine {
     if (this.stopped) return;
     this.stopped = true; this.tasks.abort();
     if (this.pinTimeout) clearTimeout(this.pinTimeout);
+    if (this.pinHangup) clearTimeout(this.pinHangup);
     clearTimeout(this.connectTimer); if (this.keepalive) clearInterval(this.keepalive);
     this.pending = []; this.pendingBytes = 0;
     this.socket.terminate();

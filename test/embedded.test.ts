@@ -143,16 +143,20 @@ describe('real loopback media and UDP cleanup (no trunk)', () => {
     const mapped = mapEmbeddedConfig(config(), { address: '127.0.0.1', port: 123 });
     mapped.SIP_LISTEN_ADDR = `127.0.0.1:${port}`;
     mapped.SIP_REGISTRAR = '127.0.0.1';
+    mapped.SIP_REGISTRAR_PORT = await freePort();
     const peer = dgram.createSocket('udp4');
-    peer.bind(0, '127.0.0.1'); await once(peer, 'listening');
+    peer.bind(mapped.SIP_REGISTRAR_PORT, '127.0.0.1'); await once(peer, 'listening');
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(new Error('test deadline')), 1000);
-    const response = setTimeout(() => peer.send(Buffer.from(`SIP/2.0 ${status}\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n`), port, '127.0.0.1'), 20);
+    peer.once('message', (buf, remote) => {
+      const headers = ['Via', 'Call-ID', 'CSeq'].map(name => buf.toString().match(new RegExp(`^${name}:.*$`, 'm'))![0].trim());
+      peer.send(Buffer.from([`SIP/2.0 ${status}`, ...headers, 'Content-Length: 0', '', ''].join('\r\n')), remote.port, remote.address);
+    });
     try {
       await expect(createSipUserAgent(mapped, log, undefined, controller.signal)).rejects.toThrow(status.startsWith('403') ? 'SIP 403' : 'without challenge');
       await assertPortReleased(port);
     } finally {
-      clearTimeout(response); clearTimeout(deadline);
+      clearTimeout(deadline);
       await new Promise<void>((resolve) => peer.close(resolve));
     }
   });

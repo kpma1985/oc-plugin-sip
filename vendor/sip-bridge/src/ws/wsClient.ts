@@ -57,7 +57,7 @@ export function createWsClient(
   const { streamSid, callSid, from, to, sipCallId, mediaFormat, extraCustomParameters } = params;
 
   return new Promise<WsClient>((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, { maxPayload: 1024 * 1024 });
 
     const timer = setTimeout(() => {
       ws.terminate();
@@ -238,14 +238,15 @@ export function createWsClient(
             } catch {
               return;
             }
+            if (!msg || typeof msg !== 'object') return;
             switch (msg.event) {
               case 'media':
-                if (msg.media?.payload !== undefined) {
+                if (typeof msg.media?.payload === 'string') {
                   enqueueOutbound(Buffer.from(msg.media.payload, 'base64'));
                 }
                 break;
               case 'mark':
-                if (msg.mark?.name !== undefined) {
+                if (typeof msg.mark?.name === 'string' && Buffer.byteLength(msg.mark.name) <= 256) {
                   log.debug({ event: 'mark_received', name: msg.mark.name }, 'mark event received');
                   outboundDrain.enqueueMark(msg.mark.name);
                 }
@@ -277,6 +278,7 @@ export function createWsClient(
             log.warn({ event: 'ws_send_skipped', reason: 'not_open' }, 'WS not OPEN — dropping mark echo');
             return;
           }
+          if (typeof markName !== 'string' || Buffer.byteLength(markName) > 256) return;
           log.debug({ event: 'mark_echoed', name: markName }, 'mark echo sent to WS backend');
           ws.send(
             JSON.stringify({
@@ -314,113 +316,93 @@ function makeDrain(
   let count = 0;
   const PACKET_MS = 20;
 
-  // Finding 4 (MCP05): hard bound on the outbound drain queue.
-  // 20 ms audio frames => 5000 frames is 100 s of buffered audio, well above any
-  // legitimate burst. Overflow drops the OLDEST audio frame and records the drop
-  // rather than growing without limit (gateway memory exhaustion / DoS).
+  // Bound every retained item, including marks and tiny views of large buffers.
   const MAX_QUEUE_ITEMS = 5000;
-  let droppedFrames = 0;
+  const MAX_QUEUE_BYTES = 800_000;
+  const MAX_MARK_BYTES = 256;
+  let queuedBytes = 0;
+  const size = (item: DrainItem): number => Buffer.isBuffer(item) ? item.length : Buffer.byteLength(item.markName);
+
+  function shift(): DrainItem | undefined {
+    const item = queue.shift();
+    if (item !== undefined) queuedBytes -= size(item);
+    return item;
+  }
+
+  function reserve(bytes: number): boolean {
+    if (bytes > MAX_QUEUE_BYTES) return false;
+    // Evict oldest items of either kind. Evicted marks are discarded, not echoed:
+    // overload must not claim that dropped audio was successfully played.
+    while (queue.length >= MAX_QUEUE_ITEMS || queuedBytes + bytes > MAX_QUEUE_BYTES) shift();
+    return true;
+  }
 
   function schedule(): void {
     const now = Date.now();
     const deadline = base + count * PACKET_MS;
-    const behind = now - deadline;
-
-    let delay: number;
-    if (behind > PACKET_MS) {
+    if (now - deadline > PACKET_MS) {
       base = now;
       count = 0;
-      delay = 0;
-    } else {
-      delay = Math.max(0, deadline - now);
     }
-
     timer = setTimeout(() => {
       timer = null;
-      const item = queue.shift();
+      const item = shift();
       if (item !== undefined) {
         if (Buffer.isBuffer(item)) {
-          // Audio frame — send and reschedule with pacing delay
           count++;
           sendPacket(item);
-          if (queue.length > 0) {
-            schedule();
-          }
-          // Queue empty after audio — drain stops; next enqueue() restarts
         } else {
-          // Mark sentinel — echo immediately, then reschedule if more items pending
           onMarkReady(item.markName);
-          if (queue.length > 0) {
-            // Don't wait 20ms for marks — process the next item right away
-            // Use delay=0 but keep count so audio pacing isn't disrupted
-            timer = setTimeout(() => {
-              timer = null;
-              const next = queue.shift();
-              if (next !== undefined) {
-                if (Buffer.isBuffer(next)) {
-                  count++;
-                  sendPacket(next);
-                  if (queue.length > 0) schedule();
-                } else {
-                  onMarkReady(next.markName);
-                  if (queue.length > 0) schedule();
-                }
-              }
-            }, 0);
-          }
-          // Queue empty after mark — drain stops
         }
       }
-    }, delay);
+      if (queue.length > 0 && timer === null) schedule();
+    }, Math.max(0, base + count * PACKET_MS - now));
+  }
+
+  function start(): void {
+    if (timer === null) {
+      base = Date.now();
+      count = 0;
+      schedule();
+    }
   }
 
   return {
     enqueue(pkt: Buffer): void {
-      // Finding 4: drop oldest audio frame once the hard bound is reached so a
-      // stalled WS consumer cannot exhaust process memory.
-      if (queue.length >= MAX_QUEUE_ITEMS) {
-        const idx = queue.findIndex((item) => Buffer.isBuffer(item));
-        if (idx >= 0) queue.splice(idx, 1);
-        droppedFrames++;
-        if (droppedFrames === 1 || droppedFrames % 500 === 0) {
-          // Reporting is throttled; the counter is monotonic.
-          // eslint-disable-next-line no-console
-        }
-      }
-      queue.push(pkt);
-      if (timer === null) {
-        base = Date.now();
-        count = 0;
-        schedule();
-      }
+      if (pkt.length === 0 || !reserve(pkt.length)) return;
+      // allocUnsafeSlow gives this item its own backing store, unlike subarray
+      // or small pooled Buffer copies which can retain unrelated allocation data.
+      const copy = Buffer.allocUnsafeSlow(pkt.length);
+      pkt.copy(copy);
+      queue.push(copy);
+      queuedBytes += copy.length;
+      start();
     },
 
     enqueueMark(name: string): void {
-      // MARK-02 fast-path: if queue is idle, echo immediately without enqueuing
+      if (typeof name !== 'string') return;
+      const bytes = Buffer.byteLength(name);
+      if (bytes > MAX_MARK_BYTES) return;
       if (queue.length === 0 && timer === null) {
         onMarkReady(name);
         return;
       }
-      // Otherwise enqueue and start timer if not already running
+      if (!reserve(bytes)) return;
       queue.push({ markName: name });
-      if (timer === null) {
-        base = Date.now();
-        count = 0;
-        schedule();
-      }
+      queuedBytes += bytes;
+      start();
     },
 
     stop(): void {
-      // MARK-03: echo all pending mark sentinels before flushing
-      for (const item of queue) {
-        if (!Buffer.isBuffer(item)) {
-          onMarkReady(item.markName);
-        }
-      }
-      queue.length = 0;
+      // Detach before callbacks so re-entrant enqueues are not silently erased.
+      const pending = queue.splice(0);
+      queuedBytes = 0;
       if (timer !== null) {
         clearTimeout(timer);
         timer = null;
+      }
+      for (const item of pending) {
+        if (!Buffer.isBuffer(item)) onMarkReady(item.markName);
       }
     },
   };

@@ -73,6 +73,8 @@ export class VoiceCall {
   private emittedEnd = -1;
   private pinState: { digits: string; attempts: number } | null = null;
   private pinAuthenticated = false;
+  private pinLocked = false;
+  private pinHangup?: NodeJS.Timeout;
   private pinTimeout?: NodeJS.Timeout;
 
   constructor(private session: CallSession, private config: SipPluginConfig,
@@ -113,9 +115,10 @@ export class VoiceCall {
     if (config.inbound.pin?.enabled && config.inbound.pin?.code) {
       this.pinState = { digits: '', attempts: 0 };
       this.pinTimeout = setTimeout(() => {
-        if (this.stopped || this.pinAuthenticated) return;
+        if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
+        this.pinLocked = true;
         this.respond(config.inbound.pin.lockoutText, false);
-        setTimeout(() => this.session.end('pin-timeout'), 3000);
+        this.pinHangup = setTimeout(() => this.session.end('pin-timeout'), 3000);
       }, config.inbound.pin.timeoutMs);
       if (config.inbound.pin.promptText) this.respond(config.inbound.pin.promptText, false);
     } else {
@@ -126,7 +129,7 @@ export class VoiceCall {
 
   /** Caller keypad input; drives the DTMF-PIN gate until authenticated. */
   dtmf(digit: string): void {
-    if (this.stopped || this.pinAuthenticated) return;
+    if (this.stopped || this.pinLocked || this.pinAuthenticated) return;
     const pin = this.config.inbound.pin;
     if (!pin?.enabled || !pin.code) return;
     if (digit === '#') {
@@ -143,9 +146,11 @@ export class VoiceCall {
       const attempts = (this.pinState?.attempts ?? 0) + 1;
       if (attempts >= pin.maxAttempts) {
         clearTimeout(this.pinTimeout);
+        this.pinState = { digits: '', attempts };
+        this.pinLocked = true;
         this.log?.('pin-lockout', { attempts });
         this.respond(pin.lockoutText, false);
-        setTimeout(() => this.session.end('pin-failed'), 3000);
+        this.pinHangup = setTimeout(() => this.session.end('pin-failed'), 3000);
         return;
       }
       this.pinState = { digits: '', attempts };
@@ -166,7 +171,7 @@ export class VoiceCall {
 
   audio(audio: Uint8Array): void {
     if (this.stopped) return;
-    if (!this.pinAuthenticated) return;
+    if (this.pinLocked || !this.pinAuthenticated) return;
     const input = this.session.media.codec === 'pcmu' ? audio : this.session.media.decode(audio);
     if (this.socket.readyState === WebSocket.OPEN) { this.send(input); return; }
     if (this.pendingBytes + input.length > this.config.voice.maxInboundBytes) { this.fail('stt-pending-overflow'); return; }
@@ -174,12 +179,13 @@ export class VoiceCall {
   }
 
   private send(audio: Uint8Array): void {
-    if (this.stopped) return;
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (this.socket.bufferedAmount + audio.length > this.config.stt.maxBufferedBytes) { this.fail('stt-buffer-overflow'); return; }
     this.socket.send(audio, { binary: true }, error => { if (error) this.fail('stt-send-failed'); });
   }
 
   private result(event: Result): void {
+    if (this.stopped || this.pinLocked || !this.pinAuthenticated) return;
     if (event.type === 'Error') { this.fail('stt-error-event'); return; }
     if (event.type === 'SpeechStarted') { this.log?.('stt-speech-start'); return; }
     if (event.type === 'UtteranceEnd') {
@@ -223,6 +229,7 @@ export class VoiceCall {
     this.session.interrupt();
   }
   private respond(text: string, agent: boolean): void {
+    if (this.stopped || (agent && (this.pinLocked || !this.pinAuthenticated))) return;
     this.interrupt();
     const generation = this.generation;
     const controller = new AbortController(); this.controller = controller;
@@ -263,6 +270,7 @@ export class VoiceCall {
     if (this.stopped) return;
     this.stopped = true;
     if (this.pinTimeout) clearTimeout(this.pinTimeout);
+    if (this.pinHangup) clearTimeout(this.pinHangup);
     this.interrupt();
     clearTimeout(this.connectTimer); if (this.keepalive) clearInterval(this.keepalive);
     this.pending = []; this.pendingBytes = 0; this.finalText = '';

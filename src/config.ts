@@ -43,6 +43,7 @@ export const sipConfigSchema = z.object({
       ).default('0.0.0.0:5060'),
       publicIp: z.ipv4().optional(),
       srtp: z.boolean().default(false),
+      srtpRequired: z.boolean().default(false),
     }).strict().superRefine((sip, context) => {
       if (sip.preset !== 'custom') return;
       for (const field of ['domain', 'registrar'] as const) {

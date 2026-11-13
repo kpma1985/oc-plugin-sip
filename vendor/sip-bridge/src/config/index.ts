@@ -39,6 +39,8 @@ const configSchema = z
       .transform((val) => val === 'true' || val === '1')
       .pipe(z.boolean())
       .default(false),
+    SIP_REGISTRAR_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+    SRTP_REQUIRED: z.string().optional().transform(val => val === 'true' || val === '1').pipe(z.boolean()).default(false),
     LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
     HTTP_PORT: z.coerce.number().int().min(1).max(65535).default(9090),
 

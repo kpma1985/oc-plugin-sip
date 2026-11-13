@@ -106,7 +106,7 @@ function buildRegister(p: {
 }
 
 function parseStatusLine(raw: string): { status: number; reason: string } {
-  const m = raw.split('\r\n')[0].match(/SIP\/2\.0 (\d+) (.*)/);
+  const m = raw.split('\r\n')[0].match(/^SIP\/2\.0 ([1-6]\d{2}) (.*)$/);
   return m ? { status: +m[1], reason: m[2] } : { status: 0, reason: 'unparseable' };
 }
 
@@ -144,7 +144,7 @@ export async function createSipUserAgent(
 ): Promise<SipHandle> {
   signal?.throwIfAborted();
   const registrar = config.SIP_REGISTRAR; // e.g. sipconnect.sipgate.de
-  const registrarPort = 5060;
+  const registrarPort = config.SIP_REGISTRAR_PORT ?? 5060;
 
   // Accept an IP-literal registrar (dns.resolve4 only takes hostnames) — needed
   // for the sipp e2e harness which points SIP_REGISTRAR at 127.0.0.1.
@@ -158,18 +158,51 @@ export async function createSipUserAgent(
   let cseq = 1;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let consecutiveFailures = 0;
-  let pingTimer: ReturnType<typeof setTimeout> | null = null;
   let optionsTimer: ReturnType<typeof setInterval> | null = null;
   let settled = false;
   let stopped = false;
 
   const socket = dgram.createSocket('udp4');
+  // One live transaction per method; new requests retire superseded transactions.
+  // RFC 3261 non-INVITE Timer F is 64*T1 (32 seconds with default T1).
+  const transactions = new Map<string, {
+    seq: string; branch: string; sentBy: string; deadline: number;
+    authRetries: number; timer: ReturnType<typeof setTimeout>;
+  }>();
+  const maxAuthRetries = 2;
+
+  function retireTransaction(method: string): void {
+    const transaction = transactions.get(method);
+    if (transaction) clearTimeout(transaction.timer);
+    transactions.delete(method);
+  }
+
+  function trackTransaction(method: string, seq: number, branch: string, authRetries = 0): void {
+    retireTransaction(method);
+    const timeout = method === 'OPTIONS' ? 5000 : 32000;
+    const transaction = {
+      seq: String(seq), branch, sentBy: `${localIp}:${localPort}`,
+      deadline: Date.now() + timeout, authRetries,
+      timer: setTimeout(() => {
+        if (transactions.get(method) !== transaction) return;
+        retireTransaction(method);
+        if (method === 'OPTIONS') handleOptionsResponse(0, new Error('OPTIONS timeout'));
+        else registrationFailed(new Error('REGISTER timeout'));
+      }, timeout),
+    };
+    transactions.set(method, transaction);
+  }
+
+  // Installed before binding/sending; also handles registration failures after startup.
+  let registrationFailed: (error: Error) => void = () => {};
 
   // Outbound (UAC) dialogs owned by the B2BUA forwarder, keyed by Call-ID.
   const dialogs = new Map<string, DialogHandlers>();
 
-  function sendRegister(authHeader?: string): void {
+  function sendRegister(authHeader?: string, authRetries = 0): void {
+    if (stopped) return;
     const branch = `z9hG4bK${randomHex(6)}`;
+    const seq = cseq++;
     const msg = buildRegister({
       user: config.SIP_USER,
       domain: config.SIP_DOMAIN,
@@ -178,11 +211,12 @@ export async function createSipUserAgent(
       localPort,
       callId,
       fromTag,
-      seq: cseq++,
+      seq,
       expires: config.SIP_EXPIRES,
       branch,
       auth: authHeader,
     });
+    trackTransaction('REGISTER', seq, branch, authRetries);
     const buf = Buffer.from(msg);
     socket.send(buf, registrarPort, registrarIp, (err) => {
       if (err) {
@@ -234,7 +268,7 @@ export async function createSipUserAgent(
       signal?.removeEventListener('abort', abort);
       if (refreshTimer) clearTimeout(refreshTimer);
       if (optionsTimer) clearInterval(optionsTimer);
-      if (pingTimer) clearTimeout(pingTimer);
+      for (const method of transactions.keys()) retireTransaction(method);
       dialogs.clear();
       socket.removeAllListeners('message');
       try { socket.close(); } catch (error) {
@@ -247,6 +281,10 @@ export async function createSipUserAgent(
       cleanup();
       reject(error);
     }
+    registrationFailed = (error) => {
+      if (!settled) fail(error);
+      else log.error({ err: error, event: 'sip_register_failed' }, error.message);
+    };
     function abort(): void {
       fail(signal?.reason instanceof Error ? signal.reason : new Error('SIP startup aborted'));
     }
@@ -274,30 +312,44 @@ export async function createSipUserAgent(
       }
 
       if (firstLine.startsWith('SIP/2.0')) {
-        // ---- CSeq routing: OPTIONS responses go to handleOptionsResponse ----
-        const cseqVal = getHeader(raw, 'CSeq') ?? '';
-        if (cseqVal.includes('OPTIONS')) {
-          if (pingTimer !== null) { clearTimeout(pingTimer); pingTimer = null; }
-          const { status } = parseStatusLine(raw);
+        // Registrar responses must match both the configured endpoint and the
+        // complete outstanding transaction, not just a method substring.
+        if (rinfo.address !== registrarIp || rinfo.port !== registrarPort) return;
+        const headers = raw.split('\r\n\r\n', 1)[0];
+        const uniqueHeader = (name: string): string | null => {
+          const values = [...headers.matchAll(new RegExp(`^${name}:[ \t]*([^\r\n]+)`, 'gim'))];
+          return values.length === 1 ? values[0][1].trim() : null;
+        };
+        const cseqVal = uniqueHeader('CSeq');
+        const parsedCseq = cseqVal?.match(/^(\d+) (REGISTER|OPTIONS)$/);
+        if (!parsedCseq || uniqueHeader('Call-ID') !== callId) return;
+        const method = parsedCseq[2];
+        const transaction = transactions.get(method);
+        if (!transaction || parsedCseq[1] !== transaction.seq) return;
+        // Via is a list: only the top entry identifies this transaction. Ignore
+        // received/rport additions, but require an unambiguous branch and sent-by.
+        const via = getHeader(headers, 'Via')?.split(',')[0];
+        const parsedVia = via?.match(/^SIP\/2\.0\/UDP ([^;\s]+)((?:;.*)?)$/);
+        const branches = parsedVia ? [...parsedVia[2].matchAll(/;branch=([^;\s,]+)/g)] : [];
+        if (!parsedVia || parsedVia[1] !== transaction.sentBy || branches.length !== 1 ||
+            branches[0][1] !== transaction.branch) return;
+        if (Date.now() >= transaction.deadline) return;
+        const { status, reason } = parseStatusLine(raw);
+        if (status < 200 || status > 699) return; // provisional responses do not consume or extend timers
+        retireTransaction(method); // consume before any callbacks / auth retry
+        if (method === 'OPTIONS') {
           handleOptionsResponse(status, null);
           return;
         }
-        // Only REGISTER responses drive the registration state machine. A response
-        // to any other request we originate (e.g. the 200/4xx to a caller-leg BYE,
-        // whose Call-ID isn't a registered dialog) must NOT be treated as a REGISTER
-        // result — otherwise it spuriously resets the re-register / keepalive timers.
-        if (!cseqVal.includes('REGISTER')) {
-          log.debug({ event: 'stray_response', cseq: cseqVal }, 'ignoring non-REGISTER response');
-          return;
-        }
-        // else: fall through to existing REGISTER response handling
-        const { status, reason } = parseStatusLine(raw);
-        if (status >= 100 && status < 200) return;
         if (status === 401 || status === 407) {
           const challengeHeader = getHeader(raw, status === 401 ? 'WWW-Authenticate' : 'Proxy-Authenticate');
           if (!challengeHeader) {
             log.error({ event: 'auth_missing', status }, `Got ${status} without auth challenge header`);
-            fail(new Error(`SIP ${status} without challenge`));
+            registrationFailed(new Error(`SIP ${status} without challenge`));
+            return;
+          }
+          if (transaction.authRetries >= maxAuthRetries) {
+            registrationFailed(new Error('SIP REGISTER authentication retry limit exceeded'));
             return;
           }
           const params = parseAuthChallenge(challengeHeader);
@@ -307,7 +359,7 @@ export async function createSipUserAgent(
           const response = md5(`${ha1}:${params['nonce']}:${ha2}`);
           const auth = `Digest username="${config.SIP_USER}", realm="${params['realm']}", nonce="${params['nonce']}", uri="${registrarUri}", response="${response}", algorithm=MD5`;
           log.debug({ event: 'auth_challenge', status }, `Responding to ${status} auth challenge`);
-          sendRegister(auth);
+          sendRegister(auth, transaction.authRetries + 1);
         } else if (status === 200) {
           log.info({ event: 'sip_registered', expires: config.SIP_EXPIRES }, 'SIP 200 OK — registration confirmed');
           const refreshMs = Math.floor(config.SIP_EXPIRES * 0.9) * 1000;
@@ -319,17 +371,17 @@ export async function createSipUserAgent(
           if (optionsTimer) clearInterval(optionsTimer);
           optionsTimer = setInterval(() => {
             const branch = `z9hG4bK${randomHex(6)}`;
-            const optBuf = Buffer.from(buildOptions(cseq++, branch));
+            if (transactions.has('OPTIONS')) return; // do not overlap keepalives
+            const seq = cseq++;
+            const optBuf = Buffer.from(buildOptions(seq, branch));
+            trackTransaction('OPTIONS', seq, branch);
             socket.send(optBuf, registrarPort, registrarIp, (err) => {
-              if (err) {
+              if (err && transactions.get('OPTIONS')?.branch === branch) {
+                retireTransaction('OPTIONS');
                 handleOptionsResponse(0, err);
               }
               // else: wait for response via socket.on('message')
             });
-            pingTimer = setTimeout(() => {
-              pingTimer = null;
-              handleOptionsResponse(0, new Error('OPTIONS timeout'));
-            }, 5000);
           }, config.SIP_OPTIONS_INTERVAL * 1000);
           if (!settled) {
             settled = true;
@@ -349,6 +401,9 @@ export async function createSipUserAgent(
                 dialogs.delete(dialogCallId);
               },
               unregister(): Promise<void> {
+                // Deregistration is send-only: retire registration so its response
+                // (or a delayed previous response) cannot restart refresh timers.
+                retireTransaction('REGISTER');
                 const branch = `z9hG4bK${randomHex(6)}`;
                 const sipUri = `sip:${config.SIP_USER}@${config.SIP_DOMAIN}`;
                 const registrarUri = `sip:${registrar}`;
@@ -378,7 +433,7 @@ export async function createSipUserAgent(
           }
         } else {
           log.error({ event: 'sip_register_failed', status, reason }, `SIP registration rejected: ${status} ${reason}`);
-          fail(new Error(`SIP ${status} ${reason}`));
+          registrationFailed(new Error(`SIP ${status} ${reason}`));
         }
       } else if (firstLine.startsWith('INVITE ')) {
         callbacks?.onInvite?.(raw, rinfo);
