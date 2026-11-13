@@ -1,0 +1,16 @@
+{
+  // Gate for the vendored upstream sources. Upstream is TypeScript ^6.0.3 too,
+  // so this compiles the whole vendored tree on every CI run.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["vendor/sip-bridge/src/**/*"]
+}

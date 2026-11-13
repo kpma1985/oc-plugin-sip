@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.vendor.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "vendor/sip-bridge/src",
+    "outDir": "dist/vendor-types",
+    "tsBuildInfoFile": "dist/vendor-types.tsbuildinfo"
+  }
+}

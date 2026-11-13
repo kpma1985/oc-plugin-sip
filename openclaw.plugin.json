@@ -1,0 +1,1811 @@
+{
+  "id": "sip",
+  "controlUi": {
+    "entry": "dist/control-ui/controlUi.js",
+    "styles": [
+      "dist/control-ui/controlUi.css"
+    ]
+  },
+  "uiCapabilities": [
+    "page",
+    "navigation"
+  ],
+  "channels": [
+    "sip"
+  ],
+  "channelConfigs": {
+    "sip": {
+      "label": "SIP Telephony",
+      "description": "SIP trunk and voice settings. Explicit channel fields override legacy plugins.entries.sip.config; omitted fields retain legacy values.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "providerPresets": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "stt": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "deepgram": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "baseUrl": {
+                        "type": "string",
+                        "format": "uri",
+                        "pattern": "^wss://"
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1,
+                        "examples": [
+                          "nova-3",
+                          "nova-2"
+                        ]
+                      }
+                    }
+                  }
+                }
+              },
+              "tts": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "deepgram": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "baseUrl": {
+                        "type": "string",
+                        "format": "uri",
+                        "pattern": "^https://"
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1,
+                        "examples": [
+                          "aura-2-viktoria-de",
+                          "aura-2-thalia-en"
+                        ]
+                      }
+                    }
+                  },
+                  "elevenlabs": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "baseUrl": {
+                        "type": "string",
+                        "format": "uri",
+                        "pattern": "^https://"
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1,
+                        "examples": [
+                          "eleven_multilingual_v2",
+                          "eleven_flash_v2_5",
+                          "eleven_turbo_v2_5"
+                        ]
+                      }
+                    }
+                  },
+                  "custom": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "baseUrl": {
+                        "type": "string",
+                        "format": "uri",
+                        "pattern": "^https://"
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1,
+                        "examples": []
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "description": "Optional provider defaults. Built-ins merge with these presets; explicit stt/tts leaves win. No API keys in presets."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "embedded",
+              "bridge"
+            ],
+            "default": "embedded",
+            "description": "embedded = SIP/RTP in this plugin process, bridge = consume an external Twilio-Media-Streams WebSocket (e.g. sipgate-sip-stream-bridge)."
+          },
+          "sip": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "preset": {
+                "type": "string",
+                "enum": [
+                  "sipgate",
+                  "custom"
+                ],
+                "default": "sipgate"
+              },
+              "user": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "properties": {
+                      "source": {
+                        "const": "store"
+                      },
+                      "provider": {
+                        "const": "default"
+                      },
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                      }
+                    }
+                  }
+                ]
+              },
+              "password": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "properties": {
+                      "source": {
+                        "const": "store"
+                      },
+                      "provider": {
+                        "const": "default"
+                      },
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                      }
+                    }
+                  }
+                ]
+              },
+              "domain": {
+                "type": "string",
+                "minLength": 1
+              },
+              "registrar": {
+                "type": "string",
+                "minLength": 1
+              },
+              "listenAddr": {
+                "type": "string",
+                "default": "0.0.0.0:5060",
+                "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]):(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
+              },
+              "publicIp": {
+                "type": "string",
+                "format": "ipv4"
+              },
+              "srtp": {
+                "type": "boolean",
+                "default": false
+              }
+            }
+          },
+          "media": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": "string",
+                "default": "127.0.0.1"
+              },
+              "port": {
+                "type": "integer",
+                "default": 8080,
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "path": {
+                "type": "string",
+                "default": "/sip/media"
+              },
+              "rtpPortMin": {
+                "type": "integer",
+                "default": 10000,
+                "minimum": 1024,
+                "maximum": 65534
+              },
+              "rtpPortMax": {
+                "type": "integer",
+                "default": 10099,
+                "minimum": 1025,
+                "maximum": 65535,
+                "description": "Must be strictly greater than rtpPortMin (runtime cross-field validation)."
+              }
+            }
+          },
+          "audio": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "twilio",
+                  "best"
+                ],
+                "default": "twilio"
+              }
+            }
+          },
+          "inbound": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "policy": {
+                "type": "string",
+                "enum": [
+                  "allowlist",
+                  "open"
+                ],
+                "default": "allowlist"
+              },
+              "allowFrom": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "callerCountryCode": {
+                "type": "string",
+                "pattern": "^[1-9]\\d{0,2}$",
+                "description": "Country calling code without +; enables national caller normalization. Leave unset for E.164 only."
+              },
+              "callerNationalPrefix": {
+                "type": "string",
+                "pattern": "^\\d{1,4}$",
+                "default": "0",
+                "description": "National trunk prefix removed before adding the configured country calling code."
+              },
+              "greeting": {
+                "type": "string",
+                "default": ""
+              },
+              "agentId": {
+                "type": "string"
+              },
+              "maxConcurrent": {
+                "type": "integer",
+                "default": 2,
+                "minimum": 1
+              },
+              "toolsAllow": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "maxItems": 100,
+                "default": [],
+                "description": "Tool names the phone agent may use. Empty disables tools (caller ID is not authentication)."
+              },
+              "pin": {
+                "type": "object",
+                "additionalProperties": false,
+                "default": {},
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "code": {
+                    "type": "string",
+                    "pattern": "^\\d{3,12}$"
+                  },
+                  "promptText": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "default": "Please enter your PIN, followed by the pound key."
+                  },
+                  "failureText": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "default": "Incorrect PIN. Please try again."
+                  },
+                  "successText": {
+                    "type": "string",
+                    "maxLength": 500,
+                    "default": ""
+                  },
+                  "lockoutText": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "default": "Too many failed attempts. Goodbye."
+                  },
+                  "maxAttempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 3
+                  },
+                  "maxDigits": {
+                    "type": "integer",
+                    "minimum": 3,
+                    "maximum": 12,
+                    "default": 8
+                  },
+                  "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 3000,
+                    "maximum": 120000,
+                    "default": 20000
+                  }
+                }
+              }
+            }
+          },
+          "stt": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "deepgram"
+                ],
+                "default": "deepgram"
+              },
+              "apiKey": {
+                "type": "string",
+                "sensitive": true,
+                "minLength": 1
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "examples": [
+                  "nova-3",
+                  "nova-2"
+                ],
+                "description": "Custom models accepted. Default nova-3 unless providerPresets overrides it."
+              },
+              "language": {
+                "type": "string",
+                "default": "de"
+              },
+              "keyterms": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "maxItems": 100,
+                "default": []
+              },
+              "endpointing": {
+                "anyOf": [
+                  {
+                    "type": "boolean",
+                    "const": false
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5000
+                  }
+                ],
+                "default": 300
+              },
+              "utteranceEndMs": {
+                "type": "integer",
+                "default": 1000,
+                "minimum": 1000,
+                "maximum": 5000
+              },
+              "connectionTimeoutMs": {
+                "type": "integer",
+                "default": 10000,
+                "minimum": 1,
+                "maximum": 60000
+              },
+              "maxBufferedBytes": {
+                "type": "integer",
+                "default": 32000,
+                "minimum": 160,
+                "maximum": 1048576
+              },
+              "baseUrl": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^wss://",
+                "description": "WSS base URL; /v1/listen appended. Default wss://api.deepgram.com."
+              }
+            }
+          },
+          "tts": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "deepgram",
+                  "custom",
+                  "elevenlabs"
+                ],
+                "default": "deepgram"
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "examples": [
+                  "aura-2-viktoria-de",
+                  "aura-2-thalia-en",
+                  "eleven_multilingual_v2",
+                  "eleven_flash_v2_5",
+                  "eleven_turbo_v2_5"
+                ],
+                "description": "Custom models accepted. Default aura-2-viktoria-de for Deepgram, eleven_multilingual_v2 for ElevenLabs. Custom requires an explicit model when voice is enabled."
+              },
+              "baseUrl": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://",
+                "description": "HTTPS base URL; provider API path appended. Custom requires an explicit URL."
+              },
+              "apiKey": {
+                "type": "string",
+                "minLength": 1
+              },
+              "voice": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Voice identifier; required for ElevenLabs and Custom when voice.enabled (runtime validation). No default voice."
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "default": 30000,
+                "minimum": 1,
+                "maximum": 120000
+              },
+              "sourceSampleRate": {
+                "type": "integer",
+                "const": 24000
+              }
+            }
+          },
+          "voice": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false
+              },
+              "maxInboundBytes": {
+                "type": "integer",
+                "default": 32000,
+                "minimum": 160,
+                "maximum": 1048576
+              },
+              "maxOutboundBytes": {
+                "type": "integer",
+                "default": 64000,
+                "minimum": 160,
+                "maximum": 1048576
+              },
+              "playbackPrebufferMs": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 2000,
+                "multipleOf": 20,
+                "description": "Streaming playback prebuffer; 0 disables. Rebuffers after underrun, capped by outbound queue limit."
+              },
+              "engine": {
+                "type": "string",
+                "enum": [
+                  "openclaw",
+                  "deepgram-agent"
+                ],
+                "default": "openclaw",
+                "description": "openclaw: STT/TTS pipeline with OpenClaw agent. deepgram-agent: Deepgram Voice Agent runs STT, LLM and TTS itself."
+              },
+              "agent": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "baseUrl": {
+                    "type": "string",
+                    "default": "wss://agent.deepgram.com"
+                  },
+                  "prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 25000
+                  },
+                  "greeting": {
+                    "type": "string"
+                  },
+                  "think": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "provider": {
+                        "type": "string",
+                        "enum": [
+                          "open_ai",
+                          "anthropic",
+                          "google",
+                          "groq",
+                          "aws_bedrock",
+                          "nvidia"
+                        ],
+                        "default": "open_ai"
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2
+                      },
+                      "endpoint": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "url"
+                        ],
+                        "properties": {
+                          "url": {
+                            "type": "string"
+                          },
+                          "headers": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "default": {}
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "tools": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Expose openclaw_task to the Deepgram agent; runs the OpenClaw agent with inbound.toolsAllow."
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "uiHints": {
+        "sip.preset": {
+          "label": "SIP provider",
+          "help": "sipgate supplies server defaults; custom requires domain and registrar under advanced settings. Existing overrides are preserved."
+        },
+        "sip.domain": {
+          "label": "SIP Domain",
+          "advanced": true,
+          "placeholder": "sipconnect.sipgate.de"
+        },
+        "sip": {
+          "label": "SIP account"
+        },
+        "inbound": {
+          "label": "Calls and access"
+        },
+        "voice": {
+          "label": "Voice assistant"
+        },
+        "stt": {
+          "label": "Speech recognition"
+        },
+        "tts": {
+          "label": "Speech output"
+        },
+        "audio": {
+          "label": "Audio quality"
+        },
+        "media": {
+          "label": "Network and media",
+          "advanced": true
+        },
+        "voice.enabled": {
+          "label": "Enable voice assistant"
+        },
+        "voice.playbackPrebufferMs": {
+          "label": "Audio prebuffer (ms)",
+          "advanced": true,
+          "placeholder": "100"
+        },
+        "inbound.agentId": {
+          "label": "OpenClaw Agent",
+          "help": "Agent ID for voice.engine openclaw and OpenClaw tool delegation from deepgram-agent. Not the Deepgram agent's own LLM model."
+        },
+        "transport": {
+          "label": "SIP transport",
+          "advanced": true
+        },
+        "sip.listenAddr": {
+          "label": "SIP listen address",
+          "advanced": true
+        },
+        "sip.srtp": {
+          "label": "SRTP",
+          "advanced": true
+        },
+        "media.host": {
+          "label": "Media WebSocket host",
+          "advanced": true
+        },
+        "media.path": {
+          "label": "Media WebSocket path",
+          "advanced": true
+        },
+        "media.rtpPortMin": {
+          "label": "RTP port minimum",
+          "advanced": true
+        },
+        "media.rtpPortMax": {
+          "label": "RTP port maximum",
+          "advanced": true
+        },
+        "stt.connectionTimeoutMs": {
+          "label": "STT connection timeout (ms)",
+          "advanced": true
+        },
+        "stt.maxBufferedBytes": {
+          "label": "STT buffer limit (bytes)",
+          "advanced": true
+        },
+        "stt.endpointing": {
+          "label": "STT endpointing",
+          "advanced": true
+        },
+        "stt.utteranceEndMs": {
+          "label": "STT utterance end (ms)",
+          "advanced": true
+        },
+        "tts.timeoutMs": {
+          "label": "TTS timeout (ms)",
+          "advanced": true
+        },
+        "tts.sourceSampleRate": {
+          "label": "TTS source sample rate (Hz)",
+          "advanced": true
+        },
+        "voice.maxInboundBytes": {
+          "label": "Inbound audio buffer limit (bytes)",
+          "advanced": true
+        },
+        "voice.maxOutboundBytes": {
+          "label": "Outbound audio buffer limit (bytes)",
+          "advanced": true
+        },
+        "inbound.greeting": {
+          "label": "Greeting"
+        },
+        "inbound.policy": {
+          "label": "Access policy"
+        },
+        "inbound.allowFrom": {
+          "label": "Allowed numbers",
+          "placeholder": "+491234567890"
+        },
+        "inbound.maxConcurrent": {
+          "label": "Concurrent calls"
+        },
+        "tts.voice": {
+          "label": "Voice / Voice ID"
+        },
+        "stt.language": {
+          "label": "Language",
+          "placeholder": "de"
+        },
+        "sip.user": {
+          "label": "SIP-ID / user"
+        },
+        "sip.password": {
+          "label": "SIP password",
+          "sensitive": true
+        },
+        "sip.registrar": {
+          "label": "Registrar",
+          "advanced": true,
+          "placeholder": "sipconnect.sipgate.de"
+        },
+        "sip.publicIp": {
+          "label": "Public IP (SDP Contact)",
+          "advanced": true,
+          "help": "Mandatory behind NAT, otherwise no RTP arrives."
+        },
+        "media.port": {
+          "label": "Media WebSocket port",
+          "advanced": true
+        },
+        "audio.mode": {
+          "label": "Codec mode",
+          "help": "twilio = PCMU/mu-law 8 kHz; best = G.722 16 kHz, then PCMA/PCMU. G.722 needs system SpanDSP."
+        },
+        "stt.provider": {
+          "label": "Speech recognition (STT)",
+          "help": "Select speech recognition provider. Currently Deepgram."
+        },
+        "tts.provider": {
+          "label": "Speech output (TTS)",
+          "help": "Deepgram or Custom for voice.engine openclaw. Native ElevenLabs only via voice.engine deepgram-agent; requires tts.apiKey and tts.voice (Voice-ID). Custom requires model, base URL and Voice-ID."
+        },
+        "stt.apiKey": {
+          "label": "STT API key",
+          "sensitive": true
+        },
+        "tts.apiKey": {
+          "label": "TTS API key",
+          "sensitive": true
+        },
+        "enabled": {
+          "label": "Enable SIP",
+          "help": "Channel values override legacy plugins.entries.sip.config. Migrate existing config before first channel edit."
+        },
+        "providerPresets": {
+          "label": "Provider presets",
+          "help": "Optional defaults per provider. Explicit STT/TTS fields override these values. Switching provider selects its preset only for omitted fields.",
+          "advanced": true
+        },
+        "stt.model": {
+          "label": "STT model",
+          "help": "Suggestions: nova-3, nova-2. Custom model/deployment IDs remain supported; SDK has no editable dropdown hint.",
+          "placeholder": "nova-3"
+        },
+        "tts.model": {
+          "label": "TTS model",
+          "help": "Suggestions: aura-2-viktoria-de, aura-2-thalia-en, eleven_multilingual_v2, eleven_flash_v2_5, eleven_turbo_v2_5. Custom model/deployment IDs remain supported; SDK has no editable dropdown hint.",
+          "placeholder": "aura-2-viktoria-de"
+        },
+        "stt.baseUrl": {
+          "label": "STT base URL",
+          "advanced": true,
+          "placeholder": "wss://api.deepgram.com",
+          "help": "WSS base URL; /v1/listen appended. Explicit value overrides preset."
+        },
+        "tts.baseUrl": {
+          "label": "TTS base URL",
+          "advanced": true,
+          "placeholder": "https://api.deepgram.com",
+          "help": "HTTPS base URL; provider API path appended. Custom requires an explicit URL."
+        },
+        "voice.engine": {
+          "label": "Voice assistant mode",
+          "help": "openclaw uses inbound.agentId with STT/TTS; its LLM is configured in OpenClaw. deepgram-agent uses its own LLM and prompt; supports native ElevenLabs TTS."
+        },
+        "voice.agent.baseUrl": {
+          "label": "Agent endpoint",
+          "advanced": true
+        },
+        "voice.agent.prompt": {
+          "label": "Agent system prompt",
+          "help": "System prompt for the Deepgram Voice Agent (voice.engine deepgram-agent)."
+        },
+        "voice.agent.greeting": {
+          "label": "Agent greeting",
+          "help": "Falls back to inbound.greeting."
+        },
+        "voice.agent.think.provider": {
+          "label": "LLM provider"
+        },
+        "voice.agent.think.model": {
+          "label": "LLM",
+          "help": "Model ID for voice.engine deepgram-agent only; not the OpenClaw agent's model. Managed models: GET https://agent.deepgram.com/v1/agent/settings/think/models"
+        },
+        "voice.agent.think.temperature": {
+          "label": "LLM temperature",
+          "advanced": true
+        },
+        "voice.agent.think.endpoint.url": {
+          "label": "Custom LLM URL",
+          "advanced": true
+        },
+        "voice.agent.think.endpoint.headers": {
+          "label": "Custom LLM headers",
+          "advanced": true,
+          "sensitive": true
+        },
+        "inbound.toolsAllow": {
+          "label": "Allowed phone tools",
+          "help": "Tool names the phone agent may call. Empty = no tools."
+        },
+        "voice.agent.tools": {
+          "label": "Agent tools via OpenClaw",
+          "help": "Lets the Deepgram agent delegate tasks to the OpenClaw agent."
+        },
+        "inbound.pin": {
+          "label": "Keypad PIN (DTMF)",
+          "help": "Protects the phone agent and its MCP tools behind a keypad PIN entry."
+        },
+        "inbound.pin.enabled": {
+          "label": "Enable PIN gate",
+          "help": "Requires a keypad PIN (DTMF) before the agent or its tools can be reached."
+        },
+        "inbound.pin.code": {
+          "label": "PIN code",
+          "help": "Digits only (3-12). Entered on the phone keypad, confirmed with the pound key (#).",
+          "sensitive": true,
+          "placeholder": "1234"
+        },
+        "inbound.pin.promptText": {
+          "label": "PIN prompt announcement",
+          "help": "Text spoken to prompt for PIN entry.",
+          "advanced": true
+        },
+        "inbound.pin.failureText": {
+          "label": "Incorrect PIN announcement",
+          "help": "Text played after a wrong PIN entry.",
+          "advanced": true
+        },
+        "inbound.pin.successText": {
+          "label": "Correct PIN announcement (optional)",
+          "help": "Optionaler Bestaetigungstext vor der eigentlichen Greeting.",
+          "advanced": true
+        },
+        "inbound.pin.lockoutText": {
+          "label": "Lockout announcement",
+          "help": "Text played when too many attempts failed, before the call is hung up.",
+          "advanced": true
+        },
+        "inbound.pin.maxAttempts": {
+          "label": "Maximum failed attempts",
+          "advanced": true
+        },
+        "inbound.pin.maxDigits": {
+          "label": "Maximum PIN length (digits)",
+          "advanced": true
+        },
+        "inbound.pin.timeoutMs": {
+          "label": "PIN entry timeout (ms)",
+          "advanced": true
+        }
+      }
+    }
+  },
+  "name": "SIP Telephony",
+  "description": "Independent SIP telephony channel for OpenClaw: embedded SIP UAS + RTP (any SIP trunk, e.g. sipgate), mu-law media over WebSocket, optional external media-stream bridge.",
+  "categories": [
+    "voice"
+  ],
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": []
+  },
+  "uiHints": {
+    "sip.preset": {
+      "label": "SIP provider",
+      "help": "sipgate supplies server defaults; custom requires domain and registrar under advanced settings. Existing overrides are preserved."
+    },
+    "sip.domain": {
+      "label": "SIP Domain",
+      "advanced": true,
+      "placeholder": "sipconnect.sipgate.de"
+    },
+    "sip": {
+      "label": "SIP account"
+    },
+    "inbound": {
+      "label": "Calls and access"
+    },
+    "voice": {
+      "label": "Voice assistant"
+    },
+    "stt": {
+      "label": "Speech recognition"
+    },
+    "tts": {
+      "label": "Speech output"
+    },
+    "audio": {
+      "label": "Audio quality"
+    },
+    "media": {
+      "label": "Network and media",
+      "advanced": true
+    },
+    "voice.enabled": {
+      "label": "Enable voice assistant"
+    },
+    "voice.playbackPrebufferMs": {
+      "label": "Audio prebuffer (ms)",
+      "advanced": true,
+      "placeholder": "100"
+    },
+    "inbound.agentId": {
+      "label": "OpenClaw Agent",
+      "help": "Agent ID for voice.engine openclaw and OpenClaw tool delegation from deepgram-agent. Not the Deepgram agent's own LLM model."
+    },
+    "transport": {
+      "label": "SIP transport",
+      "advanced": true
+    },
+    "sip.listenAddr": {
+      "label": "SIP listen address",
+      "advanced": true
+    },
+    "sip.srtp": {
+      "label": "SRTP",
+      "advanced": true
+    },
+    "media.host": {
+      "label": "Media WebSocket host",
+      "advanced": true
+    },
+    "media.path": {
+      "label": "Media WebSocket path",
+      "advanced": true
+    },
+    "media.rtpPortMin": {
+      "label": "RTP port minimum",
+      "advanced": true
+    },
+    "media.rtpPortMax": {
+      "label": "RTP port maximum",
+      "advanced": true
+    },
+    "stt.connectionTimeoutMs": {
+      "label": "STT connection timeout (ms)",
+      "advanced": true
+    },
+    "stt.maxBufferedBytes": {
+      "label": "STT buffer limit (bytes)",
+      "advanced": true
+    },
+    "stt.endpointing": {
+      "label": "STT endpointing",
+      "advanced": true
+    },
+    "stt.utteranceEndMs": {
+      "label": "STT utterance end (ms)",
+      "advanced": true
+    },
+    "tts.timeoutMs": {
+      "label": "TTS timeout (ms)",
+      "advanced": true
+    },
+    "tts.sourceSampleRate": {
+      "label": "TTS source sample rate (Hz)",
+      "advanced": true
+    },
+    "voice.maxInboundBytes": {
+      "label": "Inbound audio buffer limit (bytes)",
+      "advanced": true
+    },
+    "voice.maxOutboundBytes": {
+      "label": "Outbound audio buffer limit (bytes)",
+      "advanced": true
+    },
+    "inbound.greeting": {
+      "label": "Greeting"
+    },
+    "inbound.policy": {
+      "label": "Access policy"
+    },
+    "inbound.allowFrom": {
+      "label": "Allowed numbers",
+      "placeholder": "+491234567890"
+    },
+    "inbound.maxConcurrent": {
+      "label": "Concurrent calls"
+    },
+    "tts.voice": {
+      "label": "Voice / Voice ID"
+    },
+    "stt.language": {
+      "label": "Language",
+      "placeholder": "de"
+    },
+    "sip.user": {
+      "label": "SIP-ID / user"
+    },
+    "sip.password": {
+      "label": "SIP password",
+      "sensitive": true
+    },
+    "sip.registrar": {
+      "label": "Registrar",
+      "advanced": true,
+      "placeholder": "sipconnect.sipgate.de"
+    },
+    "sip.publicIp": {
+      "label": "Public IP (SDP Contact)",
+      "advanced": true,
+      "help": "Mandatory behind NAT, otherwise no RTP arrives."
+    },
+    "media.port": {
+      "label": "Media WebSocket port",
+      "advanced": true
+    },
+    "audio.mode": {
+      "label": "Codec mode",
+      "help": "twilio = PCMU/mu-law 8 kHz; best = G.722 16 kHz, then PCMA/PCMU. G.722 needs system SpanDSP."
+    },
+    "stt.provider": {
+      "label": "Speech recognition (STT)",
+      "help": "Select speech recognition provider. Currently Deepgram."
+    },
+    "tts.provider": {
+      "label": "Speech output (TTS)",
+      "help": "Deepgram or Custom for voice.engine openclaw. Native ElevenLabs only via voice.engine deepgram-agent; requires tts.apiKey and tts.voice (Voice-ID). Custom requires model, base URL and Voice-ID."
+    },
+    "stt.apiKey": {
+      "label": "STT API key",
+      "sensitive": true
+    },
+    "tts.apiKey": {
+      "label": "TTS API key",
+      "sensitive": true
+    },
+    "enabled": {
+      "label": "Enable SIP",
+      "help": "Channel values override legacy plugins.entries.sip.config. Migrate existing config before first channel edit."
+    },
+    "providerPresets": {
+      "label": "Provider presets",
+      "help": "Optional defaults per provider. Explicit STT/TTS fields override these values. Switching provider selects its preset only for omitted fields.",
+      "advanced": true
+    },
+    "stt.model": {
+      "label": "STT model",
+      "help": "Suggestions: nova-3, nova-2. Custom model/deployment IDs remain supported; SDK has no editable dropdown hint.",
+      "placeholder": "nova-3"
+    },
+    "tts.model": {
+      "label": "TTS model",
+      "help": "Suggestions: aura-2-viktoria-de, aura-2-thalia-en, eleven_multilingual_v2, eleven_flash_v2_5, eleven_turbo_v2_5. Custom model/deployment IDs remain supported; SDK has no editable dropdown hint.",
+      "placeholder": "aura-2-viktoria-de"
+    },
+    "stt.baseUrl": {
+      "label": "STT base URL",
+      "advanced": true,
+      "placeholder": "wss://api.deepgram.com",
+      "help": "WSS base URL; /v1/listen appended. Explicit value overrides preset."
+    },
+    "tts.baseUrl": {
+      "label": "TTS base URL",
+      "advanced": true,
+      "placeholder": "https://api.deepgram.com",
+      "help": "HTTPS base URL; provider API path appended. Custom requires an explicit URL."
+    },
+    "voice.engine": {
+      "label": "Voice assistant mode",
+      "help": "openclaw uses inbound.agentId with STT/TTS; its LLM is configured in OpenClaw. deepgram-agent uses its own LLM and prompt; supports native ElevenLabs TTS."
+    },
+    "voice.agent.baseUrl": {
+      "label": "Agent endpoint",
+      "advanced": true
+    },
+    "voice.agent.prompt": {
+      "label": "Agent system prompt",
+      "help": "System prompt for the Deepgram Voice Agent (voice.engine deepgram-agent)."
+    },
+    "voice.agent.greeting": {
+      "label": "Agent greeting",
+      "help": "Falls back to inbound.greeting."
+    },
+    "voice.agent.think.provider": {
+      "label": "LLM provider"
+    },
+    "voice.agent.think.model": {
+      "label": "LLM",
+      "help": "Model ID for voice.engine deepgram-agent only; not the OpenClaw agent's model. Managed models: GET https://agent.deepgram.com/v1/agent/settings/think/models"
+    },
+    "voice.agent.think.temperature": {
+      "label": "LLM temperature",
+      "advanced": true
+    },
+    "voice.agent.think.endpoint.url": {
+      "label": "Custom LLM URL",
+      "advanced": true
+    },
+    "voice.agent.think.endpoint.headers": {
+      "label": "Custom LLM headers",
+      "advanced": true,
+      "sensitive": true
+    },
+    "inbound.toolsAllow": {
+      "label": "Allowed phone tools",
+      "help": "Tool names the phone agent may call. Empty = no tools."
+    },
+    "voice.agent.tools": {
+      "label": "Agent tools via OpenClaw",
+      "help": "Lets the Deepgram agent delegate tasks to the OpenClaw agent."
+    },
+    "inbound.pin": {
+      "label": "Keypad PIN (DTMF)",
+      "help": "Protects the phone agent and its MCP tools behind a keypad PIN entry."
+    },
+    "inbound.pin.enabled": {
+      "label": "Enable PIN gate",
+      "help": "Requires a keypad PIN (DTMF) before the agent or its tools can be reached."
+    },
+    "inbound.pin.code": {
+      "label": "PIN code",
+      "help": "Digits only (3-12). Entered on the phone keypad, confirmed with the pound key (#).",
+      "sensitive": true,
+      "placeholder": "1234"
+    },
+    "inbound.pin.promptText": {
+      "label": "PIN prompt announcement",
+      "help": "Text spoken to prompt for PIN entry.",
+      "advanced": true
+    },
+    "inbound.pin.failureText": {
+      "label": "Incorrect PIN announcement",
+      "help": "Text played after a wrong PIN entry.",
+      "advanced": true
+    },
+    "inbound.pin.successText": {
+      "label": "Correct PIN announcement (optional)",
+      "help": "Optionaler Bestaetigungstext vor der eigentlichen Greeting.",
+      "advanced": true
+    },
+    "inbound.pin.lockoutText": {
+      "label": "Lockout announcement",
+      "help": "Text played when too many attempts failed, before the call is hung up.",
+      "advanced": true
+    },
+    "inbound.pin.maxAttempts": {
+      "label": "Maximum failed attempts",
+      "advanced": true
+    },
+    "inbound.pin.maxDigits": {
+      "label": "Maximum PIN length (digits)",
+      "advanced": true
+    },
+    "inbound.pin.timeoutMs": {
+      "label": "PIN entry timeout (ms)",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "providerPresets": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "stt": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "deepgram": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "baseUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "pattern": "^wss://"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                      "nova-3",
+                      "nova-2"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "tts": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "deepgram": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "baseUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "pattern": "^https://"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                      "aura-2-viktoria-de",
+                      "aura-2-thalia-en"
+                    ]
+                  }
+                }
+              },
+              "elevenlabs": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "baseUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "pattern": "^https://"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                      "eleven_multilingual_v2",
+                      "eleven_flash_v2_5",
+                      "eleven_turbo_v2_5"
+                    ]
+                  }
+                }
+              },
+              "custom": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "baseUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "pattern": "^https://"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": []
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "Optional provider defaults. Built-ins merge with these presets; explicit stt/tts leaves win. No API keys in presets."
+      },
+      "enabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "transport": {
+        "type": "string",
+        "enum": [
+          "embedded",
+          "bridge"
+        ],
+        "default": "embedded",
+        "description": "embedded = SIP/RTP in this plugin process, bridge = consume an external Twilio-Media-Streams WebSocket (e.g. sipgate-sip-stream-bridge)."
+      },
+      "sip": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "preset": {
+            "type": "string",
+            "enum": [
+              "sipgate",
+              "custom"
+            ],
+            "default": "sipgate"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "store"
+                  },
+                  "provider": {
+                    "const": "default"
+                  },
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                  }
+                }
+              }
+            ]
+          },
+          "password": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "store"
+                  },
+                  "provider": {
+                    "const": "default"
+                  },
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                  }
+                }
+              }
+            ]
+          },
+          "domain": {
+            "type": "string",
+            "minLength": 1
+          },
+          "registrar": {
+            "type": "string",
+            "minLength": 1
+          },
+          "listenAddr": {
+            "type": "string",
+            "default": "0.0.0.0:5060",
+            "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]):(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
+          },
+          "publicIp": {
+            "type": "string",
+            "format": "ipv4"
+          },
+          "srtp": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "media": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "port": {
+            "type": "integer",
+            "default": 8080,
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "path": {
+            "type": "string",
+            "default": "/sip/media"
+          },
+          "rtpPortMin": {
+            "type": "integer",
+            "default": 10000,
+            "minimum": 1024,
+            "maximum": 65534
+          },
+          "rtpPortMax": {
+            "type": "integer",
+            "default": 10099,
+            "minimum": 1025,
+            "maximum": 65535,
+            "description": "Must be strictly greater than rtpPortMin (runtime cross-field validation)."
+          }
+        }
+      },
+      "audio": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "twilio",
+              "best"
+            ],
+            "default": "twilio"
+          }
+        }
+      },
+      "inbound": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "policy": {
+            "type": "string",
+            "enum": [
+              "allowlist",
+              "open"
+            ],
+            "default": "allowlist"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "callerCountryCode": {
+            "type": "string",
+            "pattern": "^[1-9]\\d{0,2}$",
+            "description": "Country calling code without +; enables national caller normalization. Leave unset for E.164 only."
+          },
+          "callerNationalPrefix": {
+            "type": "string",
+            "pattern": "^\\d{1,4}$",
+            "default": "0",
+            "description": "National trunk prefix removed before adding the configured country calling code."
+          },
+          "greeting": {
+            "type": "string",
+            "default": ""
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "maxConcurrent": {
+            "type": "integer",
+            "default": 2,
+            "minimum": 1
+          },
+          "toolsAllow": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "maxItems": 100,
+            "default": [],
+            "description": "Tool names the phone agent may use. Empty disables tools (caller ID is not authentication)."
+          },
+          "pin": {
+            "type": "object",
+            "additionalProperties": false,
+            "default": {},
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false
+              },
+              "code": {
+                "type": "string",
+                "pattern": "^\\d{3,12}$"
+              },
+              "promptText": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "default": "Please enter your PIN, followed by the pound key."
+              },
+              "failureText": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "default": "Incorrect PIN. Please try again."
+              },
+              "successText": {
+                "type": "string",
+                "maxLength": 500,
+                "default": ""
+              },
+              "lockoutText": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "default": "Too many failed attempts. Goodbye."
+              },
+              "maxAttempts": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 3
+              },
+              "maxDigits": {
+                "type": "integer",
+                "minimum": 3,
+                "maximum": 12,
+                "default": 8
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 3000,
+                "maximum": 120000,
+                "default": 20000
+              }
+            }
+          }
+        }
+      },
+      "stt": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "deepgram"
+            ],
+            "default": "deepgram"
+          },
+          "apiKey": {
+            "type": "string",
+            "sensitive": true,
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "examples": [
+              "nova-3",
+              "nova-2"
+            ],
+            "description": "Custom models accepted. Default nova-3 unless providerPresets overrides it."
+          },
+          "language": {
+            "type": "string",
+            "default": "de"
+          },
+          "keyterms": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "maxItems": 100,
+            "default": []
+          },
+          "endpointing": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "const": false
+              },
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5000
+              }
+            ],
+            "default": 300
+          },
+          "utteranceEndMs": {
+            "type": "integer",
+            "default": 1000,
+            "minimum": 1000,
+            "maximum": 5000
+          },
+          "connectionTimeoutMs": {
+            "type": "integer",
+            "default": 10000,
+            "minimum": 1,
+            "maximum": 60000
+          },
+          "maxBufferedBytes": {
+            "type": "integer",
+            "default": 32000,
+            "minimum": 160,
+            "maximum": 1048576
+          },
+          "baseUrl": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^wss://",
+            "description": "WSS base URL; /v1/listen appended. Default wss://api.deepgram.com."
+          }
+        }
+      },
+      "tts": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "deepgram",
+              "custom",
+              "elevenlabs"
+            ],
+            "default": "deepgram"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "examples": [
+              "aura-2-viktoria-de",
+              "aura-2-thalia-en",
+              "eleven_multilingual_v2",
+              "eleven_flash_v2_5",
+              "eleven_turbo_v2_5"
+            ],
+            "description": "Custom models accepted. Default aura-2-viktoria-de for Deepgram, eleven_multilingual_v2 for ElevenLabs. Custom requires an explicit model when voice is enabled."
+          },
+          "baseUrl": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://",
+            "description": "HTTPS base URL; provider API path appended. Custom requires an explicit URL."
+          },
+          "apiKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "voice": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Voice identifier; required for ElevenLabs and Custom when voice.enabled (runtime validation). No default voice."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "default": 30000,
+            "minimum": 1,
+            "maximum": 120000
+          },
+          "sourceSampleRate": {
+            "type": "integer",
+            "const": 24000
+          }
+        }
+      },
+      "voice": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "maxInboundBytes": {
+            "type": "integer",
+            "default": 32000,
+            "minimum": 160,
+            "maximum": 1048576
+          },
+          "maxOutboundBytes": {
+            "type": "integer",
+            "default": 64000,
+            "minimum": 160,
+            "maximum": 1048576
+          },
+          "playbackPrebufferMs": {
+            "type": "integer",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 2000,
+            "multipleOf": 20,
+            "description": "Streaming playback prebuffer; 0 disables. Rebuffers after underrun, capped by outbound queue limit."
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "openclaw",
+              "deepgram-agent"
+            ],
+            "default": "openclaw",
+            "description": "openclaw: STT/TTS pipeline with OpenClaw agent. deepgram-agent: Deepgram Voice Agent runs STT, LLM and TTS itself."
+          },
+          "agent": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "baseUrl": {
+                "type": "string",
+                "default": "wss://agent.deepgram.com"
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 25000
+              },
+              "greeting": {
+                "type": "string"
+              },
+              "think": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "type": "string",
+                    "enum": [
+                      "open_ai",
+                      "anthropic",
+                      "google",
+                      "groq",
+                      "aws_bedrock",
+                      "nvidia"
+                    ],
+                    "default": "open_ai"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 2
+                  },
+                  "endpoint": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "url"
+                    ],
+                    "properties": {
+                      "url": {
+                        "type": "string"
+                      },
+                      "headers": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "default": {}
+                      }
+                    }
+                  }
+                }
+              },
+              "tools": {
+                "type": "boolean",
+                "default": false,
+                "description": "Expose openclaw_task to the Deepgram agent; runs the OpenClaw agent with inbound.toolsAllow."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

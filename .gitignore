@@ -1,0 +1,16 @@
+node_modules/
+*.log
+.env
+.env.*
+!.env.example
+coverage/
+.vitest/
+
+# plugin inspector output
+reports/
+
+# build artifacts kept out of git (dist is produced by npm run build / prepack)
+
+# typecheck artifacts (tsconfig.vendor-lib.json)
+dist/vendor-types/
+dist/*.tsbuildinfo
