@@ -6872,3 +6872,4 @@ export {
   plugin_default as default,
   registerSipRuntime
 };
+//# sourceMappingURL=plugin.js.map

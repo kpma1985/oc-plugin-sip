@@ -13,6 +13,8 @@ await build({
   format: 'esm',
   charset: 'utf8',
   legalComments: 'eof',
+  sourcemap: 'linked',
+  sourcesContent: true,
   logLevel: 'info',
 });
 
@@ -24,6 +26,8 @@ await build({
   platform: 'browser',
   target: 'es2022',
   format: 'esm',
+  sourcemap: 'linked',
+  sourcesContent: true,
   logLevel: 'info',
 });
 await mkdir(fileURLToPath(new URL('../dist/control-ui/', import.meta.url)), { recursive: true });

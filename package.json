@@ -1,11 +1,13 @@
 {
   "name": "@1337.so/oc-plugin-sip",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "main": "./dist/plugin.js",
   "files": [
     "dist/plugin.js",
+    "dist/plugin.js.map",
     "dist/control-ui/controlUi.js",
+    "dist/control-ui/controlUi.js.map",
     "dist/control-ui/controlUi.css",
     "openclaw.plugin.json",
     "vendor/sip-bridge/LICENSE",
