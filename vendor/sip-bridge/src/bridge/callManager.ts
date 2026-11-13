@@ -614,8 +614,48 @@ export class CallManager {
       'inbound dialog headers',
     );
 
-    // P-Asserted-Identity carries the real caller number when From is anonymous
-    const pai = extractHeader(raw, 'P-Asserted-Identity');
+    // ── Finding 1 (MCP07): authenticate the SIP peer before trusting identity ──
+    // The listener is bound to a public/local address, so a direct, unauthenticated
+    // UDP INVITE can otherwise claim any caller number via From or P-Asserted-Identity
+    // and walk straight past the channel's caller allowlist.
+    // Legitimate inbound calls must arrive from the resolved SIP registrar / carrier
+    // proxy (which authenticates the trunk), a loopback test harness, or an
+    // explicitly configured trusted peer.
+    const trustedPeers = (this.config.SIP_TRUSTED_PEERS ?? '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    const isTrustedPeer =
+      rinfo.address === this.sipHandle.registrarIp ||
+      rinfo.address === '127.0.0.1' ||
+      rinfo.address === '::1' ||
+      trustedPeers.includes(rinfo.address);
+
+    if (!isTrustedPeer) {
+      this.log.warn(
+        {
+          event: 'invite_rejected_untrusted_peer',
+          src: rinfo.address,
+          registrarIp: this.sipHandle.registrarIp,
+        },
+        'INVITE rejected — source is not the registered SIP trunk proxy',
+      );
+      const resp403 = buildResponse({
+        status: 403,
+        reason: 'Forbidden',
+        vias: extractAllVias(raw),
+        from,
+        to: toHeader,
+        callId: sipCallId,
+        cseq,
+      });
+      this.sipHandle.sendRaw(Buffer.from(resp403), rinfo.port, rinfo.address);
+      return;
+    }
+
+    // P-Asserted-Identity carries the real caller number when From is anonymous.
+    // Only honour it when the request came from the authenticated trunk peer.
+    const pai = isTrustedPeer ? extractHeader(raw, 'P-Asserted-Identity') : null;
     const fromUri = pai
       ? (pai.match(/<([^>]+)>/)?.[1] ?? pai.trim())
       : remoteUri;
@@ -624,6 +664,7 @@ export class CallManager {
     const requestUri = raw.split('\r\n')[0].match(/INVITE\s+(\S+)\s+SIP/i)?.[1]
       ?? `sip:${this.config.SIP_USER}@${this.config.SIP_DOMAIN}`;
     const toUri = requestUri;
+    let allocatedRtp: RtpHandler | undefined;
 
     try {
       // 2. Send 100 Trying immediately (no To-tag)
@@ -698,6 +739,7 @@ export class CallManager {
         remoteSrtpKey: sdpOffer.remoteSrtpKey,
         remoteSrtpSalt: sdpOffer.remoteSrtpSalt,
       });
+      allocatedRtp = rtp;
       rtp.setRemote(sdpOffer.remoteIp, sdpOffer.remotePort);
       // NAT hole-punch: send one silence packet outbound so the router creates a
       // mapping for this port. sipgate's inbound RTP will then traverse the same rule.
@@ -983,6 +1025,13 @@ export class CallManager {
     } finally {
       this.pendingInvites.delete(sipCallId);
       this.cancelledInvites.delete(sipCallId);
+      // Finding 3 (MCP05): Exception-safe cleanup of partially initialized calls.
+      // If RTP sockets were allocated but the session was not committed into
+      // this.sessions (e.g. cancelled during setup, voice URL failed, or WS rejected),
+      // dispose the socket immediately so UDP ports do not leak.
+      if (allocatedRtp && !this.sessions.has(sipCallId)) {
+        try { allocatedRtp.dispose(); } catch { /* ignore */ }
+      }
     }
   }
 

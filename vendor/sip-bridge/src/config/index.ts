@@ -7,6 +7,10 @@ const configSchema = z
     SIP_PASSWORD: z.string().min(1, 'SIP_PASSWORD is required'),
     SIP_DOMAIN: z.string().min(1, 'SIP_DOMAIN is required (e.g. sipconnect.sipgate.de)'),
     SIP_REGISTRAR: z.string().min(1, 'SIP_REGISTRAR is required (e.g. sipconnect.sipgate.de)'),
+    // Extra IPv4 peers allowed to deliver inbound INVITEs in addition to the
+    // registrar IP and loopback (comma-separated). Without this, only the
+    // registered carrier proxy may originate calls (MCP07 caller-identity trust).
+    SIP_TRUSTED_PEERS: z.string().optional(),
 
     // WS target or Voice URL — exactly one must be set (XOR enforced by .refine below).
     WS_TARGET_URL: z.string().url('WS_TARGET_URL must be a valid WebSocket URL').optional(),

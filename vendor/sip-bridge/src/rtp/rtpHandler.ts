@@ -77,6 +77,10 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
   private readonly outSsrc: number;
   /** RTP timestamp of the last emitted DTMF event — deduplicates RFC 4733 redundant End packets */
   private lastDtmfTimestamp = -1;
+  /** Locked inbound SSRC (learned from first valid packet) */
+  private inboundSsrc: number | null = null;
+  /** True once symmetric RTP has locked the inbound source port */
+  private symmetricLearned = false;
   /** SRTP decryption context for inbound packets (undefined = plain RTP) */
   private readonly decCtx?: SrtpContext;
   /** SRTP encryption context for outbound packets (undefined = plain RTP) */
@@ -99,7 +103,7 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
     this.decCtx = decCtx;
     this.encCtx = encCtx;
 
-    socket.on('message', (buf: Buffer) => this.onMessage(buf));
+    socket.on('message', (buf: Buffer, rinfo: dgram.RemoteInfo) => this.onMessage(buf, rinfo));
     socket.on('error', (err: Error) => {
       log.error({ err }, 'RTP socket error');
     });
@@ -162,7 +166,29 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
     }
   }
 
-  private onMessage(buf: Buffer): void {
+  private onMessage(buf: Buffer, rinfo: dgram.RemoteInfo): void {
+    if (buf.length < 12) return;
+
+    // Finding 2: Validate incoming media against the negotiated source IP
+    if (this.remoteIp && rinfo.address !== this.remoteIp) {
+      this.log.trace({ drop: 'ip_mismatch', src: rinfo.address, expected: this.remoteIp }, 'RTP dropped: unauthorized source address');
+      return;
+    }
+
+    // Symmetric RTP with strict port locking: allow first packet from verified IP to adjust port
+    if (this.remotePort > 0) {
+      if (rinfo.port !== this.remotePort) {
+        if (!this.symmetricLearned && this.remoteIp && rinfo.address === this.remoteIp) {
+          this.remotePort = rinfo.port;
+          this.symmetricLearned = true;
+        } else {
+          this.log.trace({ drop: 'port_mismatch', srcPort: rinfo.port, expected: this.remotePort }, 'RTP dropped: unauthorized source port');
+          return;
+        }
+      } else {
+        this.symmetricLearned = true;
+      }
+    }
     if (buf.length < 12) return; // too short for a valid RTP/SRTP header
 
     // Decrypt SRTP to plain RTP when a decryption context is configured.
@@ -189,6 +215,18 @@ class RtpHandlerImpl extends EventEmitter implements RtpHandler {
       headerLen += 4 + rtpBuf.readUInt16BE(headerLen + 2) * 4;
     }
     if (rtpBuf.length < headerLen) return;
+
+    // Validate RTP version 2 (RFC 3550 §5.1)
+    if ((rtpBuf[0] >>> 6) !== 2) return;
+
+    // Validate and lock SSRC to prevent multi-source injection into established call
+    const packetSsrc = rtpBuf.readUInt32BE(8);
+    if (this.inboundSsrc === null) {
+      this.inboundSsrc = packetSsrc;
+    } else if (packetSsrc !== this.inboundSsrc) {
+      this.log.trace({ drop: 'ssrc_mismatch', ssrc: packetSsrc, expected: this.inboundSsrc }, 'RTP dropped: SSRC changed mid-call');
+      return;
+    }
 
     const payloadType = rtpBuf[1] & 0x7f;
 

@@ -16,7 +16,7 @@ import { createWsClient } from '../vendor/sip-bridge/src/ws/wsClient.js';
 const raw = { sip: { user: 'test-user', password: 'test-password', publicIp: '127.0.0.1' } };
 const config = () => parseSipConfig(raw);
 const log = createMaskedLogger([], new Writable({ write(_chunk, _encoding, done) { done(); } }));
-const sipStub = (): SipHandle => ({ stop: vi.fn(), unregister: vi.fn(async () => { }), sendRaw: vi.fn(), registerDialog: vi.fn(), unregisterDialog: vi.fn() });
+const sipStub = (): SipHandle => ({ registrarIp: '127.0.0.1', stop: vi.fn(), unregister: vi.fn(async () => { }), sendRaw: vi.fn(), registerDialog: vi.fn(), unregisterDialog: vi.fn() });
 async function freePort(): Promise<number> {
   const socket = dgram.createSocket('udp4');
   socket.bind(0, '127.0.0.1'); await once(socket, 'listening');

@@ -4,6 +4,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { isIPv4 } from 'node:net';
 
 export interface SdpOffer {
   remoteIp: string;
@@ -71,11 +72,21 @@ export function parseSdpOffer(sdpBody: string): SdpOffer | null {
   const cMatch = sdpBody.match(/^c=IN IP4 (\S+)/m);
   if (!cMatch) return null;
   const remoteIp = cMatch[1];
+  // Only accept a routable unicast IPv4 peer address. Reject 0.0.0.0 (any),
+  // 255.255.255.255 (broadcast) and multicast 224.0.0.0/4 so an INVITE cannot
+  // steer media at a broadcast/multicast group.
+  if (!isIPv4(remoteIp) || remoteIp === '0.0.0.0' || remoteIp === '255.255.255.255') return null;
+  if (/^22[4-9]\./.test(remoteIp) || /^23[0-9]\./.test(remoteIp) || /^24[0-9]\./.test(remoteIp) || /^25[0-5]\./.test(remoteIp)) return null;
 
   // Accept both RTP/AVP (plain RTP) and RTP/SAVP (SRTP); capture the protocol name explicitly.
   const mMatch = sdpBody.match(/^m=audio\s+(\d+)\s+(RTP\/S?AVP)\s+([\d ]+)/m);
   if (!mMatch) return null;
   const remotePort = parseInt(mMatch[1], 10);
+  // RFC 8866 §5.14: the media port must be a valid unicast UDP port. Port 0 means
+  // "media stream rejected/inactive" and anything outside 1..65535 is malformed.
+  // Rejecting here keeps createRtpHandler from allocating sockets for a bogus
+  // destination (MCP05: resource leak before caller admission).
+  if (!Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535) return null;
   const protocol   = mMatch[2];
   const payloadTypes = mMatch[3].trim().split(/\s+/);
 

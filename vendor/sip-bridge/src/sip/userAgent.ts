@@ -32,6 +32,8 @@ export interface DialogHandlers {
 }
 
 export interface SipHandle {
+  /** Resolved IPv4 address of the configured SIP registrar / upstream carrier proxy. */
+  readonly registrarIp: string;
   stop(): void;
   /** Send a raw SIP message buffer to a remote address — used by CallManager to send INVITE responses and BYE */
   sendRaw(buf: Buffer, port: number, host: string): void;
@@ -333,6 +335,7 @@ export async function createSipUserAgent(
             settled = true;
             signal?.removeEventListener('abort', abort);
             resolve({
+              registrarIp,
               stop() { cleanup(); },
               sendRaw(sendBuf: Buffer, port: number, host: string): void {
                 socket.send(sendBuf, port, host, (err) => {

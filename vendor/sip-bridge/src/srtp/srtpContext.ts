@@ -116,7 +116,7 @@ export class SrtpContext {
 
     const ssrc = rtpPacket.readUInt32BE(8);
     const seq  = rtpPacket.readUInt16BE(2);
-    const packetIndex = this.getPacketIndex(seq);
+    const packetIndex = this.getOutboundPacketIndex(seq);
 
     const headerLen = this.rtpHeaderLength(rtpPacket);
     const header  = rtpPacket.subarray(0, headerLen);
@@ -147,6 +147,61 @@ export class SrtpContext {
    * Returns a new Buffer: RTP header + decrypted payload (auth tag stripped).
    * Throws on authentication failure or malformed input.
    */
+  /**
+   * Estimate candidate packet index and candidate ROC WITHOUT mutating any
+   * persistent state (RFC 3711 §3.3.1).
+   */
+  private estimateIndex(seq: number): { index: bigint; candidateRoc: number; advancesLastSeq: boolean } {
+    if (this.lastSeq < 0) {
+      return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: true };
+    }
+    const diff = seq - this.lastSeq;
+    if (diff < -SEQ_WRAP_THRESHOLD) {
+      // Forward sequence wrap (65535 -> 0): candidate ROC is current + 1
+      const candRoc = this.roc + 1;
+      return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: true };
+    }
+    if (diff > SEQ_WRAP_THRESHOLD) {
+      // Late / reordered packet from before the previous wrap: candidate ROC - 1
+      const candRoc = Math.max(0, this.roc - 1);
+      return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: false };
+    }
+    // Normal sequential packet
+    return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: true };
+  }
+
+  /**
+   * Commit verified receiver state (ROC, lastSeq) only AFTER HMAC verification
+   * has succeeded (RFC 3711 §3.3.1). Never called on unauthenticated input.
+   */
+  private commitVerifiedIndex(seq: number, candidateRoc: number, advancesLastSeq: boolean): void {
+    if (this.lastSeq < 0 || advancesLastSeq) {
+      this.lastSeq = seq;
+      this.roc = candidateRoc;
+    }
+  }
+
+  /**
+   * Compute the 48-bit SRTP packet index for an OUTBOUND packet. Sender side is
+   * authoritative, so state advances immediately.
+   */
+  private getOutboundPacketIndex(seq: number): bigint {
+    const est = this.estimateIndex(seq);
+    this.commitVerifiedIndex(seq, est.candidateRoc, est.advancesLastSeq);
+    return est.index;
+  }
+
+  /**
+   * Decrypt an SRTP packet into a plain RTP packet.
+   *
+   * The input must be a valid SRTP packet: RTP header + encrypted payload +
+   * 10-byte auth tag. Returns new Buffer: RTP header + decrypted payload.
+   * Throws on authentication failure or malformed input.
+   *
+   * Internal state (ROC, lastSeq, replay window) is committed ONLY after HMAC
+   * verification and the replay check pass. A tampered packet therefore cannot
+   * advance the rollover counter and desynchronise the receiver (DoS).
+   */
   decrypt(srtpPacket: Buffer): Buffer {
     if (srtpPacket.length < 12 + 10) throw new Error('SRTP decrypt: packet too short');
 
@@ -156,11 +211,13 @@ export class SrtpContext {
 
     const ssrc = encPacket.readUInt32BE(8);
     const seq  = encPacket.readUInt16BE(2);
-    const packetIndex = this.getPacketIndex(seq);
 
-    // Verify HMAC-SHA1-80 auth tag
+    // 1. Estimate candidate index without touching persistent ROC / lastSeq
+    const estimate = this.estimateIndex(seq);
+
+    // 2. Verify HMAC-SHA1-80 against the candidate ROC
     const rocBuf = Buffer.alloc(4);
-    rocBuf.writeUInt32BE(this.roc, 0);
+    rocBuf.writeUInt32BE(estimate.candidateRoc, 0);
     const hmac = createHmac('sha1', this.authKey);
     hmac.update(encPacket);
     hmac.update(rocBuf);
@@ -169,60 +226,25 @@ export class SrtpContext {
       throw new Error('SRTP decrypt: authentication tag mismatch');
     }
 
-    // RFC 3711 §3.3.2 anti-replay protection (64-packet sliding window)
-    if (!this.checkAndUpdateReplay(packetIndex)) {
+    // 3. RFC 3711 §3.3.2 anti-replay (64-packet sliding window)
+    if (!this.checkAndUpdateReplay(estimate.index)) {
       throw new Error('SRTP decrypt: replayed packet dropped');
     }
+
+    // 4. Commit receiver state only after authentication + replay acceptance
+    this.commitVerifiedIndex(seq, estimate.candidateRoc, estimate.advancesLastSeq);
 
     const headerLen = this.rtpHeaderLength(encPacket);
     const header    = encPacket.subarray(0, headerLen);
     const encPayload = encPacket.subarray(headerLen);
 
-    // AES-128-CTR decryption (same operation as encryption — CTR mode is symmetric)
-    const iv = computeIV(this.saltKey, ssrc, packetIndex);
+    // AES-128-CTR decryption (CTR mode is symmetric)
+    const iv = computeIV(this.saltKey, ssrc, estimate.index);
     const decipher = createCipheriv('aes-128-ctr', this.encKey, iv);
     const decPayload = decipher.update(encPayload);
 
     return Buffer.concat([header, decPayload]);
   }
-
-  /**
-   * Compute the 48-bit SRTP packet index (ROC || SEQ) for the given sequence number,
-   * and update the stored ROC and lastSeq on confirmed forward wraps (RFC 3711 §3.3.1).
-   *
-   * Three cases:
-   *   - Normal sequential: diff in [-32768, 32768] → use current ROC, update lastSeq.
-   *   - Forward wrap (diff < -32768): seq wrapped high→low → ROC++, update lastSeq.
-   *   - Late packet (diff > 32768): seq is from before a previous wrap → use ROC-1
-   *     for THIS packet's index only; do not update lastSeq or persistent ROC.
-   */
-  private getPacketIndex(seq: number): bigint {
-    if (this.lastSeq < 0) {
-      this.lastSeq = seq;
-      return BigInt(this.roc) * 65536n + BigInt(seq);
-    }
-
-    const diff = seq - this.lastSeq;
-    let roc = this.roc;
-
-    if (diff < -SEQ_WRAP_THRESHOLD) {
-      // Forward sequence wrap (e.g., 65535 → 0): increment persistent ROC.
-      this.roc++;
-      roc = this.roc;
-      this.lastSeq = seq;
-    } else if (diff > SEQ_WRAP_THRESHOLD) {
-      // Late/reordered packet from before the most recent wrap: use ROC-1 for
-      // this packet's index only. Do not update lastSeq or the persistent ROC.
-      roc = Math.max(0, this.roc - 1);
-    } else {
-      // Normal sequential packet (or minor reorder within the 32768-sample window).
-      this.lastSeq = seq;
-    }
-
-    return BigInt(roc) * 65536n + BigInt(seq);
-  }
-
-  /** Compute the RTP header length including CSRC list and extension (RFC 3550 §5.1). */
   private rtpHeaderLength(pkt: Buffer): number {
     const csrcCount = pkt[0] & 0x0f;
     const hasExt    = (pkt[0] & 0x10) !== 0;

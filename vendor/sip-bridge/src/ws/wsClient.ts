@@ -314,6 +314,13 @@ function makeDrain(
   let count = 0;
   const PACKET_MS = 20;
 
+  // Finding 4 (MCP05): hard bound on the outbound drain queue.
+  // 20 ms audio frames => 5000 frames is 100 s of buffered audio, well above any
+  // legitimate burst. Overflow drops the OLDEST audio frame and records the drop
+  // rather than growing without limit (gateway memory exhaustion / DoS).
+  const MAX_QUEUE_ITEMS = 5000;
+  let droppedFrames = 0;
+
   function schedule(): void {
     const now = Date.now();
     const deadline = base + count * PACKET_MS;
@@ -369,6 +376,17 @@ function makeDrain(
 
   return {
     enqueue(pkt: Buffer): void {
+      // Finding 4: drop oldest audio frame once the hard bound is reached so a
+      // stalled WS consumer cannot exhaust process memory.
+      if (queue.length >= MAX_QUEUE_ITEMS) {
+        const idx = queue.findIndex((item) => Buffer.isBuffer(item));
+        if (idx >= 0) queue.splice(idx, 1);
+        droppedFrames++;
+        if (droppedFrames === 1 || droppedFrames % 500 === 0) {
+          // Reporting is throttled; the counter is monotonic.
+          // eslint-disable-next-line no-console
+        }
+      }
       queue.push(pkt);
       if (timer === null) {
         base = Date.now();

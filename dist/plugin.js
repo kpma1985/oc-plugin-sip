@@ -2894,7 +2894,7 @@ var SrtpContext = class {
     if (rtpPacket.length < 12) throw new Error("SRTP encrypt: RTP packet too short");
     const ssrc = rtpPacket.readUInt32BE(8);
     const seq = rtpPacket.readUInt16BE(2);
-    const packetIndex = this.getPacketIndex(seq);
+    const packetIndex = this.getOutboundPacketIndex(seq);
     const headerLen = this.rtpHeaderLength(rtpPacket);
     const header = rtpPacket.subarray(0, headerLen);
     const payload = rtpPacket.subarray(headerLen);
@@ -2917,6 +2917,55 @@ var SrtpContext = class {
    * Returns a new Buffer: RTP header + decrypted payload (auth tag stripped).
    * Throws on authentication failure or malformed input.
    */
+  /**
+   * Estimate candidate packet index and candidate ROC WITHOUT mutating any
+   * persistent state (RFC 3711 §3.3.1).
+   */
+  estimateIndex(seq) {
+    if (this.lastSeq < 0) {
+      return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: true };
+    }
+    const diff = seq - this.lastSeq;
+    if (diff < -SEQ_WRAP_THRESHOLD) {
+      const candRoc = this.roc + 1;
+      return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: true };
+    }
+    if (diff > SEQ_WRAP_THRESHOLD) {
+      const candRoc = Math.max(0, this.roc - 1);
+      return { index: BigInt(candRoc) * 65536n + BigInt(seq), candidateRoc: candRoc, advancesLastSeq: false };
+    }
+    return { index: BigInt(this.roc) * 65536n + BigInt(seq), candidateRoc: this.roc, advancesLastSeq: true };
+  }
+  /**
+   * Commit verified receiver state (ROC, lastSeq) only AFTER HMAC verification
+   * has succeeded (RFC 3711 §3.3.1). Never called on unauthenticated input.
+   */
+  commitVerifiedIndex(seq, candidateRoc, advancesLastSeq) {
+    if (this.lastSeq < 0 || advancesLastSeq) {
+      this.lastSeq = seq;
+      this.roc = candidateRoc;
+    }
+  }
+  /**
+   * Compute the 48-bit SRTP packet index for an OUTBOUND packet. Sender side is
+   * authoritative, so state advances immediately.
+   */
+  getOutboundPacketIndex(seq) {
+    const est = this.estimateIndex(seq);
+    this.commitVerifiedIndex(seq, est.candidateRoc, est.advancesLastSeq);
+    return est.index;
+  }
+  /**
+   * Decrypt an SRTP packet into a plain RTP packet.
+   *
+   * The input must be a valid SRTP packet: RTP header + encrypted payload +
+   * 10-byte auth tag. Returns new Buffer: RTP header + decrypted payload.
+   * Throws on authentication failure or malformed input.
+   *
+   * Internal state (ROC, lastSeq, replay window) is committed ONLY after HMAC
+   * verification and the replay check pass. A tampered packet therefore cannot
+   * advance the rollover counter and desynchronise the receiver (DoS).
+   */
   decrypt(srtpPacket) {
     if (srtpPacket.length < 12 + 10) throw new Error("SRTP decrypt: packet too short");
     const tagStart = srtpPacket.length - 10;
@@ -2924,9 +2973,9 @@ var SrtpContext = class {
     const receivedTag = srtpPacket.subarray(tagStart);
     const ssrc = encPacket.readUInt32BE(8);
     const seq = encPacket.readUInt16BE(2);
-    const packetIndex = this.getPacketIndex(seq);
+    const estimate = this.estimateIndex(seq);
     const rocBuf = Buffer.alloc(4);
-    rocBuf.writeUInt32BE(this.roc, 0);
+    rocBuf.writeUInt32BE(estimate.candidateRoc, 0);
     const hmac = createHmac("sha1", this.authKey);
     hmac.update(encPacket);
     hmac.update(rocBuf);
@@ -2934,46 +2983,18 @@ var SrtpContext = class {
     if (!expectedTag.equals(receivedTag)) {
       throw new Error("SRTP decrypt: authentication tag mismatch");
     }
-    if (!this.checkAndUpdateReplay(packetIndex)) {
+    if (!this.checkAndUpdateReplay(estimate.index)) {
       throw new Error("SRTP decrypt: replayed packet dropped");
     }
+    this.commitVerifiedIndex(seq, estimate.candidateRoc, estimate.advancesLastSeq);
     const headerLen = this.rtpHeaderLength(encPacket);
     const header = encPacket.subarray(0, headerLen);
     const encPayload = encPacket.subarray(headerLen);
-    const iv = computeIV(this.saltKey, ssrc, packetIndex);
+    const iv = computeIV(this.saltKey, ssrc, estimate.index);
     const decipher = createCipheriv("aes-128-ctr", this.encKey, iv);
     const decPayload = decipher.update(encPayload);
     return Buffer.concat([header, decPayload]);
   }
-  /**
-   * Compute the 48-bit SRTP packet index (ROC || SEQ) for the given sequence number,
-   * and update the stored ROC and lastSeq on confirmed forward wraps (RFC 3711 §3.3.1).
-   *
-   * Three cases:
-   *   - Normal sequential: diff in [-32768, 32768] → use current ROC, update lastSeq.
-   *   - Forward wrap (diff < -32768): seq wrapped high→low → ROC++, update lastSeq.
-   *   - Late packet (diff > 32768): seq is from before a previous wrap → use ROC-1
-   *     for THIS packet's index only; do not update lastSeq or persistent ROC.
-   */
-  getPacketIndex(seq) {
-    if (this.lastSeq < 0) {
-      this.lastSeq = seq;
-      return BigInt(this.roc) * 65536n + BigInt(seq);
-    }
-    const diff = seq - this.lastSeq;
-    let roc = this.roc;
-    if (diff < -SEQ_WRAP_THRESHOLD) {
-      this.roc++;
-      roc = this.roc;
-      this.lastSeq = seq;
-    } else if (diff > SEQ_WRAP_THRESHOLD) {
-      roc = Math.max(0, this.roc - 1);
-    } else {
-      this.lastSeq = seq;
-    }
-    return BigInt(roc) * 65536n + BigInt(seq);
-  }
-  /** Compute the RTP header length including CSRC list and extension (RFC 3550 §5.1). */
   rtpHeaderLength(pkt) {
     const csrcCount = pkt[0] & 15;
     const hasExt = (pkt[0] & 16) !== 0;
@@ -3041,7 +3062,7 @@ var RtpHandlerImpl = class extends EventEmitter2 {
     this.outSsrc = randomBytes(4).readUInt32BE(0);
     this.decCtx = decCtx;
     this.encCtx = encCtx;
-    socket.on("message", (buf) => this.onMessage(buf));
+    socket.on("message", (buf, rinfo) => this.onMessage(buf, rinfo));
     socket.on("error", (err) => {
       log.error({ err }, "RTP socket error");
     });
@@ -3060,6 +3081,10 @@ var RtpHandlerImpl = class extends EventEmitter2 {
   outSsrc;
   /** RTP timestamp of the last emitted DTMF event — deduplicates RFC 4733 redundant End packets */
   lastDtmfTimestamp = -1;
+  /** Locked inbound SSRC (learned from first valid packet) */
+  inboundSsrc = null;
+  /** True once symmetric RTP has locked the inbound source port */
+  symmetricLearned = false;
   /** SRTP decryption context for inbound packets (undefined = plain RTP) */
   decCtx;
   /** SRTP encryption context for outbound packets (undefined = plain RTP) */
@@ -3110,7 +3135,25 @@ var RtpHandlerImpl = class extends EventEmitter2 {
     } catch {
     }
   }
-  onMessage(buf) {
+  onMessage(buf, rinfo) {
+    if (buf.length < 12) return;
+    if (this.remoteIp && rinfo.address !== this.remoteIp) {
+      this.log.trace({ drop: "ip_mismatch", src: rinfo.address, expected: this.remoteIp }, "RTP dropped: unauthorized source address");
+      return;
+    }
+    if (this.remotePort > 0) {
+      if (rinfo.port !== this.remotePort) {
+        if (!this.symmetricLearned && this.remoteIp && rinfo.address === this.remoteIp) {
+          this.remotePort = rinfo.port;
+          this.symmetricLearned = true;
+        } else {
+          this.log.trace({ drop: "port_mismatch", srcPort: rinfo.port, expected: this.remotePort }, "RTP dropped: unauthorized source port");
+          return;
+        }
+      } else {
+        this.symmetricLearned = true;
+      }
+    }
     if (buf.length < 12) return;
     let rtpBuf = buf;
     if (this.decCtx) {
@@ -3131,6 +3174,14 @@ var RtpHandlerImpl = class extends EventEmitter2 {
       headerLen += 4 + rtpBuf.readUInt16BE(headerLen + 2) * 4;
     }
     if (rtpBuf.length < headerLen) return;
+    if (rtpBuf[0] >>> 6 !== 2) return;
+    const packetSsrc = rtpBuf.readUInt32BE(8);
+    if (this.inboundSsrc === null) {
+      this.inboundSsrc = packetSsrc;
+    } else if (packetSsrc !== this.inboundSsrc) {
+      this.log.trace({ drop: "ssrc_mismatch", ssrc: packetSsrc, expected: this.inboundSsrc }, "RTP dropped: SSRC changed mid-call");
+      return;
+    }
     const payloadType = rtpBuf[1] & 127;
     if (!this.forwardingEnabled) return;
     if (payloadType === this.audioPt) {
@@ -3222,6 +3273,7 @@ function bindSocketOnPort(port, log, audioPt, dtmfPt, silenceByte, decCtx, encCt
 
 // vendor/sip-bridge/src/sip/sdp.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
+import { isIPv4 as isIPv43 } from "node:net";
 function selectAudioCodec(offered, mode) {
   const CODEC_MAP = {
     9: { pt: 9, encoding: "audio/G722", sampleRate: 16e3, silenceByte: 0 },
@@ -3241,9 +3293,12 @@ function parseSdpOffer(sdpBody) {
   const cMatch = sdpBody.match(/^c=IN IP4 (\S+)/m);
   if (!cMatch) return null;
   const remoteIp = cMatch[1];
+  if (!isIPv43(remoteIp) || remoteIp === "0.0.0.0" || remoteIp === "255.255.255.255") return null;
+  if (/^22[4-9]\./.test(remoteIp) || /^23[0-9]\./.test(remoteIp) || /^24[0-9]\./.test(remoteIp) || /^25[0-5]\./.test(remoteIp)) return null;
   const mMatch = sdpBody.match(/^m=audio\s+(\d+)\s+(RTP\/S?AVP)\s+([\d ]+)/m);
   if (!mMatch) return null;
   const remotePort = parseInt(mMatch[1], 10);
+  if (!Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535) return null;
   const protocol = mMatch[2];
   const payloadTypes = mMatch[3].trim().split(/\s+/);
   const isSrtp = protocol === "RTP/SAVP";
@@ -3526,6 +3581,8 @@ function makeDrain(sendPacket, onMarkReady) {
   let base = 0;
   let count = 0;
   const PACKET_MS = 20;
+  const MAX_QUEUE_ITEMS = 5e3;
+  let droppedFrames = 0;
   function schedule() {
     const now = Date.now();
     const deadline = base + count * PACKET_MS;
@@ -3572,6 +3629,13 @@ function makeDrain(sendPacket, onMarkReady) {
   }
   return {
     enqueue(pkt) {
+      if (queue.length >= MAX_QUEUE_ITEMS) {
+        const idx = queue.findIndex((item) => Buffer.isBuffer(item));
+        if (idx >= 0) queue.splice(idx, 1);
+        droppedFrames++;
+        if (droppedFrames === 1 || droppedFrames % 500 === 0) {
+        }
+      }
       queue.push(pkt);
       if (timer === null) {
         base = Date.now();
@@ -4637,10 +4701,34 @@ var CallManager = class {
       },
       "inbound dialog headers"
     );
-    const pai = extractHeader(raw, "P-Asserted-Identity");
+    const trustedPeers = (this.config.SIP_TRUSTED_PEERS ?? "").split(",").map((entry2) => entry2.trim()).filter((entry2) => entry2.length > 0);
+    const isTrustedPeer = rinfo.address === this.sipHandle.registrarIp || rinfo.address === "127.0.0.1" || rinfo.address === "::1" || trustedPeers.includes(rinfo.address);
+    if (!isTrustedPeer) {
+      this.log.warn(
+        {
+          event: "invite_rejected_untrusted_peer",
+          src: rinfo.address,
+          registrarIp: this.sipHandle.registrarIp
+        },
+        "INVITE rejected — source is not the registered SIP trunk proxy"
+      );
+      const resp403 = buildResponse({
+        status: 403,
+        reason: "Forbidden",
+        vias: extractAllVias(raw),
+        from,
+        to: toHeader,
+        callId: sipCallId,
+        cseq
+      });
+      this.sipHandle.sendRaw(Buffer.from(resp403), rinfo.port, rinfo.address);
+      return;
+    }
+    const pai = isTrustedPeer ? extractHeader(raw, "P-Asserted-Identity") : null;
     const fromUri = pai ? pai.match(/<([^>]+)>/)?.[1] ?? pai.trim() : remoteUri;
     const requestUri = raw.split("\r\n")[0].match(/INVITE\s+(\S+)\s+SIP/i)?.[1] ?? `sip:${this.config.SIP_USER}@${this.config.SIP_DOMAIN}`;
     const toUri = requestUri;
+    let allocatedRtp;
     try {
       const vias = extractAllVias(raw);
       const recordRoutes = extractAllRecordRoutes(raw);
@@ -4698,6 +4786,7 @@ var CallManager = class {
         remoteSrtpKey: sdpOffer.remoteSrtpKey,
         remoteSrtpSalt: sdpOffer.remoteSrtpSalt
       });
+      allocatedRtp = rtp;
       rtp.setRemote(sdpOffer.remoteIp, sdpOffer.remotePort);
       rtp.sendAudio(encodeSilence());
       if (this.cancelledInvites.has(sipCallId)) {
@@ -4939,6 +5028,12 @@ var CallManager = class {
     } finally {
       this.pendingInvites.delete(sipCallId);
       this.cancelledInvites.delete(sipCallId);
+      if (allocatedRtp && !this.sessions.has(sipCallId)) {
+        try {
+          allocatedRtp.dispose();
+        } catch {
+        }
+      }
     }
   }
   // ── Private: CANCEL handler ─────────────────────────────────────────────────
@@ -5437,6 +5532,7 @@ async function createSipUserAgent(config, log, callbacks, signal) {
             settled = true;
             signal?.removeEventListener("abort", abort);
             resolve({
+              registrarIp,
               stop() {
                 cleanup();
               },
