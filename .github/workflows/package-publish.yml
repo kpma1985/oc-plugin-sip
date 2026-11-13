@@ -46,6 +46,7 @@ jobs:
       - name: Publish to ClawHub
         run: |
           npx --yes clawhub@latest package publish . \
+            --source-ref "$GITHUB_REF" \
             --wait \
             ${{ inputs.dry_run && '--dry-run' || '' }}
         env:
