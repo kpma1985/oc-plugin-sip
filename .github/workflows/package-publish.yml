@@ -43,6 +43,14 @@ jobs:
       - name: Validate package
         run: npx --yes clawhub@latest package validate .
 
+      - name: Authenticate with ClawHub
+        if: ${{ !inputs.dry_run }}
+        run: |
+          test -n "$CLAWHUB_TOKEN" || { echo "CLAWHUB_TOKEN secret is missing"; exit 1; }
+          npx --yes clawhub@latest login --token "$CLAWHUB_TOKEN" --no-browser
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+
       - name: Publish to ClawHub
         run: |
           npx --yes clawhub@latest package publish . \
